@@ -1,0 +1,74 @@
+﻿name: Build and Release Tectonic Synth
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: TectonicSynth-Windows
+          - os: macos-latest
+            artifact: TectonicSynth-macOS
+          - os: ubuntu-latest
+            artifact: TectonicSynth-Linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build Plugin
+        run: cmake --build build --config Release
+      - name: Package Windows plugin and installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/package | Out-Null
+          Copy-Item build/Release/TectonicSynth.clap build/package/TectonicSynth.clap
+          Compress-Archive -Path build/package/TectonicSynth.clap -DestinationPath build/package/TectonicSynth-Windows.zip
+          choco install innosetup -y --no-progress
+          $version = '${{ github.ref_name }}' -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '4.0.0' }
+          $env:APP_VERSION = $version
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          & $compiler 'installer/TectonicSynth.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package macOS plugin
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p build/package
+          ditto -c -k --keepParent build/TectonicSynth.clap build/package/TectonicSynth-macOS.zip
+      - name: Package Linux plugin
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p build/package
+          tar -czf build/package/TectonicSynth-Linux.tar.gz -C build TectonicSynth.clap
+      - name: Upload packaged downloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/package/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TectonicSynth-*
+          path: release-files
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-files/* --title "Tectonic Synth $GITHUB_REF_NAME" --generate-notes
