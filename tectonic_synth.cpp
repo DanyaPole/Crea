@@ -543,7 +543,7 @@ static const char* const s_features[] = { CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_P
 static const clap_plugin_descriptor_t s_descriptor = {
     .clap_version = CLAP_VERSION_INIT, .id = "com.experimental.tectonic-synth",
     .name = "Tectonic Experimental Synth v4", .vendor = "Experimental Audio Lab",
-    .url = "https://clapdb.org", .manual_url = "", .support_url = "", .version = "4.0.0",
+    .url = "https://clapdb.org", .manual_url = "", .support_url = "", .version = "4.0.2",
     .description = "Holographic Bio-Luminescent GUI, Quantum Entanglement & 4D Continuum Synth", .features = s_features
 };
 

@@ -17,8 +17,6 @@ jobs:
             artifact: TectonicSynth-Windows
           - os: macos-latest
             artifact: TectonicSynth-macOS
-          - os: ubuntu-latest
-            artifact: TectonicSynth-Linux
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +33,7 @@ jobs:
           Compress-Archive -Path build/package/TectonicSynth.clap -DestinationPath build/package/TectonicSynth-Windows.zip
           choco install innosetup -y --no-progress
           $version = '${{ github.ref_name }}' -replace '^v', ''
-          if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '4.0.1' }
+          if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '4.0.2' }
           $env:APP_VERSION = $version
           $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
           & $compiler 'installer/TectonicSynth.iss'
@@ -45,11 +43,6 @@ jobs:
         run: |
           mkdir -p build/package
           ditto -c -k --keepParent build/TectonicSynth.clap build/package/TectonicSynth-macOS.zip
-      - name: Package Linux plugin
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p build/package
-          tar -czf build/package/TectonicSynth-Linux.tar.gz -C build TectonicSynth.clap
       - name: Upload packaged downloads
         uses: actions/upload-artifact@v4
         with:
@@ -60,7 +53,7 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Download all platform packages
