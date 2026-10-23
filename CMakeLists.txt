@@ -11,16 +11,12 @@ if(APPLE)
 endif()
 
 include(FetchContent)
-FetchContent_Declare(
+FetchContent_Populate(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG v1.90.1
     GIT_SHALLOW TRUE
 )
-FetchContent_GetProperties(imgui)
-if(NOT imgui_POPULATED)
-    FetchContent_Populate(imgui)
-endif()
 
 set(IMGUI_SOURCES
     "${imgui_SOURCE_DIR}/imgui.cpp"
@@ -60,6 +56,11 @@ else()
 endif()
 
 if(WIN32)
+    set_target_properties(TectonicCLAP PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "TectonicSynth"
+        SUFFIX ".clap"
+    )
     target_link_libraries(TectonicCLAP PRIVATE opengl32)
 elseif(APPLE)
     target_link_libraries(TectonicCLAP PRIVATE "-framework Cocoa" "-framework OpenGL" "-framework GameController")
