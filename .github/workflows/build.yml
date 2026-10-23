@@ -34,7 +34,7 @@ jobs:
           Compress-Archive -Path build/package/TectonicSynth.clap -DestinationPath build/package/TectonicSynth-Windows.zip
           choco install innosetup -y --no-progress
           $version = '${{ github.ref_name }}' -replace '^v', ''
-          if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '4.0.2' }
+          if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '5.0.0' }
           $env:APP_VERSION = $version
           $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
           & $compiler 'installer/TectonicSynth.iss'

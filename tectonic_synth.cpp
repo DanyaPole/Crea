@@ -5,27 +5,16 @@
 #include <cstdlib>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <numbers>
 #include <vector>
 
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <objc/objc.h>
-#include <objc/message.h>
-#else
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#endif
+#include <imgui.h>
+
+#include "gui_platform.h"
 
 // ============================================================================
-// TECTONIC EXPERIMENTAL SYNTH v4.0 — UNIFIED SOURCE WITH GUI & DSP
+// TECTONIC EXPERIMENTAL SYNTH v5.0 — IMGUI OBSERVATORY & DSP
 // ============================================================================
 
 enum ParamIds : clap_id {
@@ -149,20 +138,17 @@ struct StereoSpaceDiffuser {
 struct TectonicPlugin {
     const clap_host_t* host = nullptr;
     float sample_rate = 48000.0f; uint64_t voice_counter = 0; FastRNG rng;
-    std::array<float, PARAM_COUNT> params{0.35f, 0.40f, 0.44f, 0.45f, 0.30f, 0.45f, 0.74f, 0.26f, 0.0f, 0.015f, 1.8f, 0.38f, 0.76f};
+    std::array<std::atomic<float>, PARAM_COUNT> params{0.35f, 0.40f, 0.44f, 0.45f, 0.30f, 0.45f, 0.74f, 0.26f, 0.0f, 0.015f, 1.8f, 0.38f, 0.76f};
     std::array<float, PARAM_COUNT> global_mod{};
     std::array<Voice, MAX_VOICES> voices{};
     QuantumEntanglementField qfield{};
     StereoSpaceDiffuser diffuser{};
     TectonicTelemetry telemetry{};
-    bool gui_is_open = false;
-#if defined(_WIN32)
-    HWND hwnd = nullptr;
-#elif defined(__APPLE__)
-    void* ns_view = nullptr;
-#else
-    Display* x11_display = nullptr; Window x11_window = 0;
-#endif
+    ImGuiContext* imgui_context = nullptr;
+    void* platform_gui = nullptr;
+    std::atomic<uint32_t> gui_pending_values{0};
+    std::atomic<uint32_t> gui_pending_gesture_begin{0};
+    std::atomic<uint32_t> gui_pending_gesture_end{0};
 
     static void sendNoteEnd(const clap_output_events_t* out_events, const Voice& v, uint32_t sample_time) {
         if (!out_events || !out_events->try_push) return;
@@ -209,7 +195,7 @@ struct TectonicPlugin {
             }
             case CLAP_EVENT_PARAM_VALUE: {
                 auto* ev = reinterpret_cast<const clap_event_param_value_t*>(hdr);
-                if (ev->param_id < PARAM_COUNT) params[ev->param_id] = static_cast<float>(ev->value);
+                if (ev->param_id < PARAM_COUNT) params[ev->param_id].store(static_cast<float>(ev->value), std::memory_order_relaxed);
                 break;
             }
             case CLAP_EVENT_PARAM_MOD: {
@@ -313,15 +299,15 @@ struct TectonicPlugin {
 
     void renderVoice(Voice& v, float attack_sec, float decay_sec, uint32_t sample_time, const clap_output_events_t* out_events, float& outL, float& outR, float& sum_fx, float& sum_fy, float& sum_energy, float& sum_freq, int voice_idx) {
         if (!v.active) return;
-        float eng_pos = std::clamp(params[PARAM_ENGINE_CONTINUUM] + global_mod[PARAM_ENGINE_CONTINUUM] + v.mod_engine * 4.0f, 0.0f, 4.0f);
-        float x = std::clamp(params[PARAM_MORPH_X] + global_mod[PARAM_MORPH_X] + v.mod_morph_x + v.expr_timbre * 0.5f, 0.0f, 1.0f);
-        float y = std::clamp(params[PARAM_CHAOS_Y] + global_mod[PARAM_CHAOS_Y] + v.mod_chaos_y + v.expr_pressure * 0.6f, 0.0f, 1.0f);
-        float entangle = std::clamp(params[PARAM_ENTANGLEMENT] + global_mod[PARAM_ENTANGLEMENT] + v.mod_entangle, 0.0f, 1.0f);
-        float plasma = std::clamp(params[PARAM_PLASMA_LENSING] + global_mod[PARAM_PLASMA_LENSING] + v.mod_plasma, 0.0f, 1.0f);
-        float grav = std::clamp(params[PARAM_GRAVITY] + global_mod[PARAM_GRAVITY] + v.mod_gravity, 0.0f, 1.0f);
-        float cutoff_norm = std::clamp(params[PARAM_CUTOFF] + global_mod[PARAM_CUTOFF] + v.mod_cutoff + v.expr_brightness * 0.4f + v.velocity * 0.15f, 0.0f, 1.0f);
-        float res_norm = std::clamp(params[PARAM_RESONANCE] + global_mod[PARAM_RESONANCE] + v.mod_res, 0.0f, 0.96f);
-        float fmorph = std::clamp(params[PARAM_FILTER_MORPH] + global_mod[PARAM_FILTER_MORPH] + v.mod_fmorph, 0.0f, 1.0f);
+        float eng_pos = std::clamp(params[PARAM_ENGINE_CONTINUUM].load(std::memory_order_relaxed) + global_mod[PARAM_ENGINE_CONTINUUM] + v.mod_engine * 4.0f, 0.0f, 4.0f);
+        float x = std::clamp(params[PARAM_MORPH_X].load(std::memory_order_relaxed) + global_mod[PARAM_MORPH_X] + v.mod_morph_x + v.expr_timbre * 0.5f, 0.0f, 1.0f);
+        float y = std::clamp(params[PARAM_CHAOS_Y].load(std::memory_order_relaxed) + global_mod[PARAM_CHAOS_Y] + v.mod_chaos_y + v.expr_pressure * 0.6f, 0.0f, 1.0f);
+        float entangle = std::clamp(params[PARAM_ENTANGLEMENT].load(std::memory_order_relaxed) + global_mod[PARAM_ENTANGLEMENT] + v.mod_entangle, 0.0f, 1.0f);
+        float plasma = std::clamp(params[PARAM_PLASMA_LENSING].load(std::memory_order_relaxed) + global_mod[PARAM_PLASMA_LENSING] + v.mod_plasma, 0.0f, 1.0f);
+        float grav = std::clamp(params[PARAM_GRAVITY].load(std::memory_order_relaxed) + global_mod[PARAM_GRAVITY] + v.mod_gravity, 0.0f, 1.0f);
+        float cutoff_norm = std::clamp(params[PARAM_CUTOFF].load(std::memory_order_relaxed) + global_mod[PARAM_CUTOFF] + v.mod_cutoff + v.expr_brightness * 0.4f + v.velocity * 0.15f, 0.0f, 1.0f);
+        float res_norm = std::clamp(params[PARAM_RESONANCE].load(std::memory_order_relaxed) + global_mod[PARAM_RESONANCE] + v.mod_res, 0.0f, 0.96f);
+        float fmorph = std::clamp(params[PARAM_FILTER_MORPH].load(std::memory_order_relaxed) + global_mod[PARAM_FILTER_MORPH] + v.mod_fmorph, 0.0f, 1.0f);
 
         float target_freq = v.base_freq * std::pow(2.0f, v.expr_pitch / 12.0f);
         if (qfield.active_count > 1 && plasma > 0.01f) {
@@ -405,12 +391,15 @@ static bool CLAP_ABI paramsGetInfo(const clap_plugin_t*, uint32_t index, clap_pa
         "Attack (sec)", "Release / Tail (sec)", "Abyssal Shimmer Space", "Master Gain"
     };
     std::snprintf(info->name, sizeof(info->name), "%s", names[index]);
-    info->max_value = (index == 0) ? 4.0 : ((index == 9 || index == 10) ? 5.0 : 1.0);
-    info->default_value = (index == 0) ? 0.35 : ((index == 1) ? 0.40 : ((index == 6) ? 0.74 : ((index == 11) ? 0.38 : ((index == 12) ? 0.76 : 0.45))));
+    info->min_value = (index == PARAM_ATTACK) ? 0.002 : ((index == PARAM_DECAY) ? 0.05 : 0.0);
+    info->max_value = (index == PARAM_ENGINE_CONTINUUM) ? 4.0 : ((index == PARAM_ATTACK) ? 3.0 : ((index == PARAM_DECAY) ? 8.0 : 1.0));
+    constexpr double defaults[PARAM_COUNT] = {0.35, 0.40, 0.44, 0.45, 0.30, 0.45, 0.74, 0.26, 0.0, 0.015, 1.8, 0.38, 0.76};
+    info->default_value = defaults[index];
     return true;
 }
 static bool CLAP_ABI paramsGetValue(const clap_plugin_t* plugin, clap_id id, double* value) {
-    *value = static_cast<TectonicPlugin*>(plugin->plugin_data)->params[id];
+    if (id >= PARAM_COUNT || !value) return false;
+    *value = static_cast<TectonicPlugin*>(plugin->plugin_data)->params[id].load(std::memory_order_relaxed);
     return true;
 }
 static bool CLAP_ABI paramsValueToText(const clap_plugin_t*, clap_id id, double value, char* display, uint32_t size) {
@@ -422,50 +411,256 @@ static bool CLAP_ABI paramsTextToValue(const clap_plugin_t*, clap_id, const char
     *value = std::atof(display);
     return true;
 }
+struct HostParamsExtension {
+    void (CLAP_ABI *rescan)(const clap_host_t* host, uint32_t flags);
+    void (CLAP_ABI *clear)(const clap_host_t* host, clap_id param_id, uint32_t flags);
+    void (CLAP_ABI *request_flush)(const clap_host_t* host);
+};
+
+static bool pushParamGesture(const clap_output_events_t* out, clap_id id, uint16_t type) {
+    if (!out || !out->try_push) return false;
+    clap_event_param_gesture_t event{};
+    event.header.size = sizeof(event);
+    event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    event.header.type = type;
+    event.param_id = id;
+    return out->try_push(out, &event.header);
+}
+
+static void flushGuiParameters(TectonicPlugin* plug, const clap_output_events_t* out) {
+    const uint32_t begins = plug->gui_pending_gesture_begin.exchange(0, std::memory_order_acq_rel);
+    const uint32_t values = plug->gui_pending_values.exchange(0, std::memory_order_acq_rel);
+    const uint32_t ends = plug->gui_pending_gesture_end.exchange(0, std::memory_order_acq_rel);
+    if (!(begins | values | ends)) return;
+
+    for (clap_id id = 0; id < PARAM_COUNT; ++id) {
+        const uint32_t bit = 1u << id;
+        if ((begins & bit) && !pushParamGesture(out, id, CLAP_EVENT_PARAM_GESTURE_BEGIN)) {
+            plug->gui_pending_gesture_begin.fetch_or(begins & ~((bit << 1) - 1u), std::memory_order_release);
+            plug->gui_pending_values.fetch_or(values & ~((bit << 1) - 1u), std::memory_order_release);
+            plug->gui_pending_gesture_end.fetch_or(ends & ~((bit << 1) - 1u), std::memory_order_release);
+            break;
+        }
+
+        if (values & bit) {
+            clap_event_param_value_t event{};
+            event.header.size = sizeof(event);
+            event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            event.header.type = CLAP_EVENT_PARAM_VALUE;
+            event.param_id = id;
+            event.note_id = -1;
+            event.port_index = -1;
+            event.channel = -1;
+            event.key = -1;
+            event.value = plug->params[id].load(std::memory_order_relaxed);
+            if (!out || !out->try_push || !out->try_push(out, &event.header)) {
+                plug->gui_pending_values.fetch_or(values & ~((bit << 1) - 1u), std::memory_order_release);
+                plug->gui_pending_gesture_end.fetch_or(ends & ~((bit << 1) - 1u), std::memory_order_release);
+                break;
+            }
+        }
+
+        if ((ends & bit) && !pushParamGesture(out, id, CLAP_EVENT_PARAM_GESTURE_END)) {
+            plug->gui_pending_gesture_end.fetch_or(ends & ~((bit << 1) - 1u), std::memory_order_release);
+            break;
+        }
+    }
+}
+
 static void CLAP_ABI paramsFlush(const clap_plugin_t* plugin, const clap_input_events_t* in, const clap_output_events_t* out) {
     auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
-    for (uint32_t i = 0; i < in->size(in); ++i) plug->handleEvent(in->get(in, i), out);
+    if (in && in->size && in->get)
+        for (uint32_t i = 0; i < in->size(in); ++i) plug->handleEvent(in->get(in, i), out);
+    flushGuiParameters(plug, out);
 }
 static const clap_plugin_params_t s_params_ext = { paramsCount, paramsGetInfo, paramsGetValue, paramsValueToText, paramsTextToValue, paramsFlush };
 
 static bool CLAP_ABI stateSave(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
     auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
-    uint32_t magic = 0x54454334; stream->write(stream, &magic, sizeof(magic));
-    for (size_t i = 0; i < PARAM_COUNT; ++i) stream->write(stream, &plug->params[i], sizeof(float));
+    uint32_t magic = 0x54454334;
+    if (stream->write(stream, &magic, sizeof(magic)) != sizeof(magic)) return false;
+    for (size_t i = 0; i < PARAM_COUNT; ++i) {
+        const float value = plug->params[i].load(std::memory_order_relaxed);
+        if (stream->write(stream, &value, sizeof(value)) != sizeof(value)) return false;
+    }
     return true;
 }
 static bool CLAP_ABI stateLoad(const clap_plugin_t* plugin, const clap_istream_t* stream) {
     auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
-    uint32_t magic = 0; stream->read(stream, &magic, sizeof(magic));
+    uint32_t magic = 0;
+    if (stream->read(stream, &magic, sizeof(magic)) != sizeof(magic)) return false;
     if (magic != 0x54454334) return false;
-    for (size_t i = 0; i < PARAM_COUNT; ++i) stream->read(stream, &plug->params[i], sizeof(float));
+    std::array<float, PARAM_COUNT> values{};
+    for (size_t i = 0; i < PARAM_COUNT; ++i) {
+        if (stream->read(stream, &values[i], sizeof(values[i])) != sizeof(values[i])) return false;
+    }
+    for (size_t i = 0; i < PARAM_COUNT; ++i)
+        plug->params[i].store(values[i], std::memory_order_relaxed);
     return true;
 }
 static const clap_plugin_state_t s_state_ext = { stateSave, stateLoad };
 
+extern "C" void tectonicDrawGui(void* plugin_data) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin_data);
+    if (!plug) return;
+
+    uint32_t gesture_begins = 0;
+    uint32_t gesture_ends = 0;
+    bool params_changed = false;
+    const auto slider = [&](const char* label, ParamIds id, float minimum, float maximum) {
+        float value = plug->params[id].load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(label, &value, minimum, maximum)) {
+            plug->params[id].store(value, std::memory_order_relaxed);
+            plug->gui_pending_values.fetch_or(1u << id, std::memory_order_release);
+            params_changed = true;
+        }
+        if (ImGui::IsItemActivated())
+            gesture_begins |= 1u << id;
+        if (ImGui::IsItemDeactivated())
+            gesture_ends |= 1u << id;
+    };
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(960.0f, 600.0f), ImGuiCond_Always);
+    ImGui::Begin("Tectonic Observatory", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.88f, 1.0f), "TECTONIC  /  EXPERIMENTAL SYNTH");
+    ImGui::SameLine();
+    ImGui::TextDisabled("VERSION 5.0.0  |  16-VOICE FIELD");
+    ImGui::Separator();
+
+    ImGui::Columns(2, "controls", false);
+    ImGui::Text("ENGINE CONTINUUM");
+    slider("Engine", PARAM_ENGINE_CONTINUUM, 0.0f, 4.0f);
+    ImGui::Text("STRUCTURE / MORPH");
+    const ImVec2 pad_size(420.0f, 185.0f);
+    const ImVec2 pad_origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("Continuum XY", pad_size);
+    if (ImGui::IsItemActivated()) {
+        gesture_begins |= (1u << PARAM_MORPH_X) | (1u << PARAM_CHAOS_Y);
+    }
+    const ImVec2 pad_end(pad_origin.x + pad_size.x, pad_origin.y + pad_size.y);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(pad_origin, pad_end, IM_COL32(8, 21, 35, 255), 8.0f);
+    draw->AddRect(pad_origin, pad_end, IM_COL32(29, 93, 112, 255), 8.0f);
+    for (int i = 1; i < 8; ++i) {
+        const float x = pad_origin.x + pad_size.x * static_cast<float>(i) / 8.0f;
+        draw->AddLine(ImVec2(x, pad_origin.y), ImVec2(x, pad_end.y), IM_COL32(22, 57, 70, 180));
+    }
+    for (int i = 1; i < 4; ++i) {
+        const float y = pad_origin.y + pad_size.y * static_cast<float>(i) / 4.0f;
+        draw->AddLine(ImVec2(pad_origin.x, y), ImVec2(pad_end.x, y), IM_COL32(22, 57, 70, 180));
+    }
+    if (ImGui::IsItemActive()) {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const float x = std::clamp((mouse.x - pad_origin.x) / pad_size.x, 0.0f, 1.0f);
+        const float y = 1.0f - std::clamp((mouse.y - pad_origin.y) / pad_size.y, 0.0f, 1.0f);
+        const float old_x = plug->params[PARAM_MORPH_X].load(std::memory_order_relaxed);
+        const float old_y = plug->params[PARAM_CHAOS_Y].load(std::memory_order_relaxed);
+        if (x != old_x || y != old_y) {
+            plug->params[PARAM_MORPH_X].store(x, std::memory_order_relaxed);
+            plug->params[PARAM_CHAOS_Y].store(y, std::memory_order_relaxed);
+            plug->gui_pending_values.fetch_or((1u << PARAM_MORPH_X) | (1u << PARAM_CHAOS_Y), std::memory_order_release);
+            params_changed = true;
+        }
+    }
+    if (ImGui::IsItemDeactivated())
+        gesture_ends |= (1u << PARAM_MORPH_X) | (1u << PARAM_CHAOS_Y);
+    const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.0f);
+    const ImVec2 marker(
+        pad_origin.x + plug->params[PARAM_MORPH_X].load(std::memory_order_relaxed) * pad_size.x,
+        pad_origin.y + (1.0f - plug->params[PARAM_CHAOS_Y].load(std::memory_order_relaxed)) * pad_size.y);
+    draw->AddCircle(marker, 12.0f + pulse * 4.0f, IM_COL32(38, 240, 218, 255), 32, 2.0f);
+    draw->AddCircleFilled(marker, 4.0f, IM_COL32(227, 255, 250, 255));
+    ImGui::Text("X  %.2f", plug->params[PARAM_MORPH_X].load(std::memory_order_relaxed));
+    ImGui::SameLine(130.0f);
+    ImGui::Text("Y  %.2f", plug->params[PARAM_CHAOS_Y].load(std::memory_order_relaxed));
+    ImGui::NextColumn();
+
+    ImGui::Text("QUANTUM FIELD");
+    slider("Entanglement", PARAM_ENTANGLEMENT, 0.0f, 1.0f);
+    slider("Plasma Lensing", PARAM_PLASMA_LENSING, 0.0f, 1.0f);
+    slider("Gravity", PARAM_GRAVITY, 0.0f, 1.0f);
+    ImGui::Spacing();
+    ImGui::Text("FILTER / ENVELOPE");
+    slider("Cutoff", PARAM_CUTOFF, 0.0f, 1.0f);
+    slider("Resonance", PARAM_RESONANCE, 0.0f, 0.96f);
+    slider("Filter Morph", PARAM_FILTER_MORPH, 0.0f, 1.0f);
+    slider("Attack", PARAM_ATTACK, 0.002f, 3.0f);
+    slider("Release", PARAM_DECAY, 0.05f, 8.0f);
+    ImGui::Spacing();
+    ImGui::Text("SPACE / OUTPUT");
+    slider("Space", PARAM_SPACE, 0.0f, 1.0f);
+    slider("Master Gain", PARAM_GAIN, 0.0f, 1.0f);
+    ImGui::Columns(1);
+    ImGui::End();
+
+    if (gesture_begins)
+        plug->gui_pending_gesture_begin.fetch_or(gesture_begins, std::memory_order_release);
+    if (gesture_ends)
+        plug->gui_pending_gesture_end.fetch_or(gesture_ends, std::memory_order_release);
+
+    if ((params_changed || gesture_begins || gesture_ends) && plug->host && plug->host->get_extension) {
+        auto* host_params = static_cast<const HostParamsExtension*>(plug->host->get_extension(plug->host, CLAP_EXT_PARAMS));
+        if (host_params && host_params->request_flush)
+            host_params->request_flush(plug->host);
+    }
+}
+
 static bool CLAP_ABI guiIsApiSupported(const clap_plugin_t*, const char* api, bool is_floating) {
-    if (is_floating) return false;
+    if (is_floating || !api) return false;
 #if defined(_WIN32)
     return !std::strcmp(api, CLAP_WINDOW_API_WIN32);
 #elif defined(__APPLE__)
     return !std::strcmp(api, CLAP_WINDOW_API_NS_VIEW);
 #else
-    return !std::strcmp(api, CLAP_WINDOW_API_X11);
+    return false;
 #endif
 }
 static bool CLAP_ABI guiGetPreferredApi(const clap_plugin_t*, const char** api, bool* is_floating) {
+    if (!api || !is_floating) return false;
     *is_floating = false;
 #if defined(_WIN32)
     *api = CLAP_WINDOW_API_WIN32;
 #elif defined(__APPLE__)
     *api = CLAP_WINDOW_API_NS_VIEW;
 #else
-    *api = CLAP_WINDOW_API_X11;
+    return false;
 #endif
     return true;
 }
-static bool CLAP_ABI guiCreate(const clap_plugin_t* plugin, const char*, bool) { static_cast<TectonicPlugin*>(plugin->plugin_data)->gui_is_open = true; return true; }
-static void CLAP_ABI guiDestroy(const clap_plugin_t* plugin) { static_cast<TectonicPlugin*>(plugin->plugin_data)->gui_is_open = false; }
+static bool CLAP_ABI guiCreate(const clap_plugin_t* plugin, const char* api, bool is_floating) {
+    if (!api || is_floating || !guiIsApiSupported(plugin, api, is_floating)) return false;
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    if (plug->imgui_context) return false;
+    plug->imgui_context = ImGui::CreateContext();
+    if (!plug->imgui_context) return false;
+    ImGui::SetCurrentContext(plug->imgui_context);
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 8.0f;
+    style.FrameRounding = 5.0f;
+    style.GrabRounding = 5.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.025f, 0.035f, 0.065f, 1.0f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.07f, 0.12f, 0.17f, 1.0f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.08f, 0.27f, 0.30f, 1.0f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.08f, 0.37f, 0.38f, 1.0f);
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.15f, 0.82f, 0.75f, 1.0f);
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.36f, 1.0f, 0.87f, 1.0f);
+    return true;
+}
+static void CLAP_ABI guiDestroy(const clap_plugin_t* plugin) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    if (plug->platform_gui) {
+        tectonicGuiDestroy(plug->platform_gui, plug->imgui_context);
+        plug->platform_gui = nullptr;
+    }
+    if (plug->imgui_context) {
+        ImGui::SetCurrentContext(plug->imgui_context);
+        ImGui::DestroyContext(plug->imgui_context);
+        plug->imgui_context = nullptr;
+    }
+}
 static bool CLAP_ABI guiSetScale(const clap_plugin_t*, double) { return true; }
 static bool CLAP_ABI guiGetSize(const clap_plugin_t*, uint32_t* w, uint32_t* h) { *w = 960; *h = 600; return true; }
 static bool CLAP_ABI guiCanResize(const clap_plugin_t*) { return false; }
@@ -473,18 +668,30 @@ static bool CLAP_ABI guiSetSize(const clap_plugin_t*, uint32_t, uint32_t) { retu
 static bool CLAP_ABI guiSetParent(const clap_plugin_t* plugin, const clap_window_t* window) {
     auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
 #if defined(_WIN32)
-    plug->hwnd = static_cast<HWND>(window->win32);
+    if (!window || !window->win32) return false;
+    return tectonicGuiAttach(plug, window->win32, plug->imgui_context, &plug->platform_gui);
 #elif defined(__APPLE__)
-    plug->ns_view = window->ns_view;
+    if (!window || !window->ns_view) return false;
+    return tectonicGuiAttach(plug, window->ns_view, plug->imgui_context, &plug->platform_gui);
 #else
-    plug->x11_display = static_cast<Display*>(window->x11.display); plug->x11_window = static_cast<Window>(window->x11.window);
+    (void)window;
+    return false;
 #endif
-    return true;
 }
 static bool CLAP_ABI guiSetTransient(const clap_plugin_t*, const clap_window_t*) { return true; }
 static void CLAP_ABI guiSuggestTitle(const clap_plugin_t*, const char*) {}
-static bool CLAP_ABI guiShow(const clap_plugin_t*) { return true; }
-static bool CLAP_ABI guiHide(const clap_plugin_t*) { return true; }
+static bool CLAP_ABI guiShow(const clap_plugin_t* plugin) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    if (!plug->platform_gui) return false;
+    tectonicGuiShow(plug->platform_gui, true);
+    return true;
+}
+static bool CLAP_ABI guiHide(const clap_plugin_t* plugin) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    if (!plug->platform_gui) return false;
+    tectonicGuiShow(plug->platform_gui, false);
+    return true;
+}
 static const clap_plugin_gui_t s_gui_ext = { guiIsApiSupported, guiGetPreferredApi, guiCreate, guiDestroy, guiSetScale, guiGetSize, guiCanResize, guiSetSize, guiSetParent, guiSetTransient, guiSuggestTitle, guiShow, guiHide };
 
 static uint32_t CLAP_ABI audioPortsCount(const clap_plugin_t*, bool is_input) { return is_input ? 0 : 1; }
@@ -520,7 +727,7 @@ static clap_process_status CLAP_ABI pluginProcess(const clap_plugin_t* plugin, c
         for (int v = 0; v < MAX_VOICES; ++v) {
             if (plug->voices[v].active) {
                 active_cnt++;
-                plug->renderVoice(plug->voices[v], std::clamp(plug->params[PARAM_ATTACK], 0.002f, 3.0f), std::clamp(plug->params[PARAM_DECAY], 0.05f, 8.0f), s, process->out_events, voicesL, voicesR, sum_fx, sum_fy, sum_energy, sum_freq, v);
+                plug->renderVoice(plug->voices[v], std::clamp(plug->params[PARAM_ATTACK].load(std::memory_order_relaxed), 0.002f, 3.0f), std::clamp(plug->params[PARAM_DECAY].load(std::memory_order_relaxed), 0.05f, 8.0f), s, process->out_events, voicesL, voicesR, sum_fx, sum_fy, sum_energy, sum_freq, v);
             } else {
                 plug->telemetry.voices[v].active = false;
             }
@@ -535,9 +742,10 @@ static clap_process_status CLAP_ABI pluginProcess(const clap_plugin_t* plugin, c
             plug->qfield.field_x *= 0.99f; plug->qfield.field_y *= 0.99f; plug->qfield.plasma_energy *= 0.99f;
         }
         float spacedL = 0.0f, spacedR = 0.0f;
-        plug->diffuser.process(voicesL, voicesR, std::clamp(plug->params[PARAM_SPACE], 0.0f, 1.0f), plug->qfield.plasma_energy, plug->sample_rate, spacedL, spacedR);
-        outL[s] = std::tanh(spacedL * std::clamp(plug->params[PARAM_GAIN], 0.0f, 1.0f));
-        if (outR != outL) outR[s] = std::tanh(spacedR * std::clamp(plug->params[PARAM_GAIN], 0.0f, 1.0f));
+        plug->diffuser.process(voicesL, voicesR, std::clamp(plug->params[PARAM_SPACE].load(std::memory_order_relaxed), 0.0f, 1.0f), plug->qfield.plasma_energy, plug->sample_rate, spacedL, spacedR);
+        const float gain = std::clamp(plug->params[PARAM_GAIN].load(std::memory_order_relaxed), 0.0f, 1.0f);
+        outL[s] = std::tanh(spacedL * gain);
+        if (outR != outL) outR[s] = std::tanh(spacedR * gain);
     }
     return CLAP_PROCESS_CONTINUE;
 }
@@ -545,9 +753,9 @@ static clap_process_status CLAP_ABI pluginProcess(const clap_plugin_t* plugin, c
 static const char* const s_features[] = { CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUGIN_FEATURE_SYNTHESIZER, CLAP_PLUGIN_FEATURE_STEREO, nullptr };
 static const clap_plugin_descriptor_t s_descriptor = {
     .clap_version = CLAP_VERSION_INIT, .id = "com.experimental.tectonic-synth",
-    .name = "Tectonic Experimental Synth v4", .vendor = "Experimental Audio Lab",
-    .url = "https://clapdb.org", .manual_url = "", .support_url = "", .version = "4.0.2",
-    .description = "Holographic Bio-Luminescent GUI, Quantum Entanglement & 4D Continuum Synth", .features = s_features
+    .name = "Tectonic Experimental Synth v5", .vendor = "Experimental Audio Lab",
+    .url = "https://clapdb.org", .manual_url = "", .support_url = "", .version = "5.0.0",
+    .description = "Dear ImGui Observatory, Quantum Entanglement & 4D Continuum Synth", .features = s_features
 };
 
 static bool CLAP_ABI pluginInit(const clap_plugin_t*) { return true; }
