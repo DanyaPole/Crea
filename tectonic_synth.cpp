@@ -12,6 +12,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <objc/objc.h>
@@ -555,7 +558,7 @@ static bool CLAP_ABI pluginActivate(const clap_plugin_t* p, double sr, uint32_t,
 static void CLAP_ABI pluginDeactivate(const clap_plugin_t*) {}
 static bool CLAP_ABI pluginStartProcessing(const clap_plugin_t*) { return true; }
 static void CLAP_ABI pluginStopProcessing(const clap_plugin_t*) {}
-static bool CLAP_ABI pluginReset(const clap_plugin_t* p) {
+static void CLAP_ABI pluginReset(const clap_plugin_t* p) {
     auto* plug = static_cast<TectonicPlugin*>(p->plugin_data); for (auto& v : plug->voices) v.active = false; plug->qfield.reset(); plug->diffuser.reset();
 }
 static const void* CLAP_ABI pluginGetExtension(const clap_plugin_t*, const char* id) {
@@ -578,9 +581,13 @@ static const clap_plugin_t* CLAP_ABI factoryCreatePlugin(const clap_plugin_facto
 }
 static const clap_plugin_factory_t s_factory = { factoryGetPluginCount, factoryGetPluginDescriptor, factoryCreatePlugin };
 
+static const void* CLAP_ABI entryGetFactory(const char* fid) {
+    return fid && !std::strcmp(fid, CLAP_PLUGIN_FACTORY_ID) ? &s_factory : nullptr;
+}
+
 extern "C" CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
     .clap_version = CLAP_VERSION_INIT,
     .init = [](const char*) { return true; },
     .deinit = []() {},
-    .get_factory = [](const char* fid) { return (fid && !std::strcmp(fid, CLAP_PLUGIN_FACTORY_ID)) ? &s_factory : nullptr; }
+    .get_factory = entryGetFactory
 };
