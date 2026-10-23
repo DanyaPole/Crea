@@ -1,4 +1,4 @@
-#include "clap/clap.h"
+﻿#include "clap/clap.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -13,7 +13,7 @@ constexpr char kVendor[] = "Experimental";
 constexpr char kUrl[] = "https://example.invalid/tectonic";
 constexpr char kManualUrl[] = "https://example.invalid/tectonic/manual";
 constexpr char kSupportUrl[] = "https://example.invalid/tectonic/support";
-constexpr char kVersion[] = "4.0.0";
+constexpr char kVersion[] = "4.0.1";
 constexpr char kDescription[] = "A minimal CLAP synthesizer plugin for Tectonic.";
 
 constexpr const char *kFeatures[] = {
@@ -507,3 +507,4 @@ extern "C" CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
     clap_entry_deinit,
     clap_entry_get_factory,
 };
+

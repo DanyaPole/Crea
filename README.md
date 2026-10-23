@@ -15,5 +15,6 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
-Create a version tag such as `v4.0.0` and push it to publish Windows, macOS, and Linux downloads as a GitHub Release.
+Create a version tag such as `v4.0.1` and push it to publish Windows, macOS, and Linux downloads as a GitHub Release.
+
 
