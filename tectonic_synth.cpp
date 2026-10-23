@@ -1,510 +1,586 @@
-﻿#include "clap/clap.h"
-
-#include <cstddef>
+﻿#include <clap/clap.h>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <array>
+#include <algorithm>
+#include <numbers>
+#include <vector>
 
-namespace {
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <objc/objc.h>
+#include <objc/message.h>
+#else
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#endif
 
-constexpr char kPluginId[] = "com.experimental.tectonic-synth";
-constexpr char kPluginName[] = "Tectonic Synth";
-constexpr char kVendor[] = "Experimental";
-constexpr char kUrl[] = "https://example.invalid/tectonic";
-constexpr char kManualUrl[] = "https://example.invalid/tectonic/manual";
-constexpr char kSupportUrl[] = "https://example.invalid/tectonic/support";
-constexpr char kVersion[] = "4.0.1";
-constexpr char kDescription[] = "A minimal CLAP synthesizer plugin for Tectonic.";
+// ============================================================================
+// TECTONIC EXPERIMENTAL SYNTH v4.0 — UNIFIED SOURCE WITH GUI & DSP
+// ============================================================================
 
-constexpr const char *kFeatures[] = {
-    CLAP_PLUGIN_FEATURE_INSTRUMENT,
-    CLAP_PLUGIN_FEATURE_SYNTHESIZER,
-    CLAP_PLUGIN_FEATURE_STEREO,
-    nullptr,
+enum ParamIds : clap_id {
+    PARAM_ENGINE_CONTINUUM = 0,
+    PARAM_MORPH_X = 1,
+    PARAM_CHAOS_Y = 2,
+    PARAM_ENTANGLEMENT = 3,
+    PARAM_PLASMA_LENSING = 4,
+    PARAM_GRAVITY = 5,
+    PARAM_CUTOFF = 6,
+    PARAM_RESONANCE = 7,
+    PARAM_FILTER_MORPH = 8,
+    PARAM_ATTACK = 9,
+    PARAM_DECAY = 10,
+    PARAM_SPACE = 11,
+    PARAM_GAIN = 12,
+    PARAM_COUNT
 };
 
-enum : clap_id {
-    kParamGain = 0,
-    kParamTune = 1,
+static constexpr int MAX_VOICES = 16;
+static constexpr int CA_SIZE = 32;
+static constexpr int WG_SIZE = 2048;
+
+struct FastRNG {
+    uint32_t state = 2463534242u;
+    float nextFloat() {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        return (static_cast<float>(state) / static_cast<float>(0xFFFFFFFFu)) * 2.0f - 1.0f;
+    }
+};
+
+struct PolySVF {
+    float ic1eq = 0.0f;
+    float ic2eq = 0.0f;
+    void reset() { ic1eq = 0.0f; ic2eq = 0.0f; }
+    float process(float v0, float cutoff_hz, float res, float morph, float sr) {
+        float nyquist = sr * 0.47f;
+        float fc = std::clamp(cutoff_hz, 25.0f, nyquist);
+        float g = std::tan(std::numbers::pi_v<float> * (fc / sr));
+        float k = 2.0f - 1.93f * std::clamp(res, 0.0f, 0.98f);
+        float a1 = 1.0f / (1.0f + g * (g + k));
+        float a2 = g * a1; float a3 = g * a2;
+        float v3 = v0 - ic2eq;
+        float v1 = a1 * ic1eq + a2 * v3;
+        float v2 = ic2eq + a2 * ic1eq + a3 * v3;
+        ic1eq = 2.0f * v1 - ic1eq; ic2eq = 2.0f * v2 - ic2eq;
+        if (!std::isfinite(ic1eq) || !std::isfinite(ic2eq)) { reset(); return 0.0f; }
+        float lp = v2; float bp = v1; float hp = v0 - k * v1 - v2; float notch = lp + hp;
+        if (morph < 0.3333f) return lp * (1.0f - morph * 3.0f) + bp * (morph * 3.0f);
+        if (morph < 0.6666f) return bp * (1.0f - (morph - 0.3333f) * 3.0f) + hp * ((morph - 0.3333f) * 3.0f);
+        return hp * (1.0f - (morph - 0.6666f) * 3.0f) + notch * ((morph - 0.6666f) * 3.0f);
+    }
+};
+
+struct QuantumEntanglementField {
+    float field_x = 0.0f; float field_y = 0.0f; float plasma_energy = 0.0f; float centroid_freq = 261.6f; int active_count = 0;
+    void reset() { field_x = 0.0f; field_y = 0.0f; plasma_energy = 0.0f; centroid_freq = 261.6f; active_count = 0; }
+};
+
+struct VoiceVisualState {
+    bool active = false; float phase = 0.0f; float env = 0.0f; float engine_pos = 0.0f; float x = 0.0f; float y = 0.0f; float pan = 0.5f; int key = 60;
+};
+
+struct TectonicTelemetry {
+    std::array<VoiceVisualState, MAX_VOICES> voices{};
+    float field_x = 0.0f; float field_y = 0.0f; float plasma_energy = 0.0f; int active_count = 0;
+};
+
+struct Voice {
+    bool active = false; bool held = false; int32_t note_id = -1; int16_t port_index = 0; int16_t channel = 0; int16_t key = 0; uint64_t age = 0;
+    float base_freq = 440.0f; float current_freq = 440.0f; float velocity = 0.8f; float phase = 0.0f; float sub_phase = 0.0f; float env = 0.0f; float env_stage = 0.0f; float last_out = 0.0f;
+    float mod_engine = 0.0f; float mod_morph_x = 0.0f; float mod_chaos_y = 0.0f; float mod_entangle = 0.0f; float mod_plasma = 0.0f; float mod_gravity = 0.0f; float mod_cutoff = 0.0f; float mod_res = 0.0f; float mod_fmorph = 0.0f;
+    float expr_pitch = 0.0f; float expr_timbre = 0.0f; float expr_pressure = 0.0f; float expr_brightness = 0.0f; float expr_volume = 1.0f; float expr_pan = 0.5f;
+    std::array<float, CA_SIZE> cells{}; std::array<float, CA_SIZE> next_cells{}; float ca_clock = 0.0f;
+    std::array<float, 6> swarm_phases{};
+    float lx = 0.1f, ly = 0.0f, lz = 0.0f; float wg_last = 0.0f;
+    std::array<float, WG_SIZE> delay_line{}; int write_pos = 0; float ap_state = 0.0f; float lp_state = 0.0f;
+    float soliton_u = 0.5f; float soliton_v = 0.0f; float soliton_fold = 0.0f;
+    PolySVF svf{}; float dc_x1 = 0.0f; float dc_y1 = 0.0f;
+
+    void trigger(int32_t id, int16_t port, int16_t ch, int16_t k, float vel, uint64_t current_age, FastRNG& rng, bool steal_smooth) {
+        active = true; held = true; note_id = id; port_index = port; channel = ch; key = k; age = current_age;
+        base_freq = 440.0f * std::pow(2.0f, (static_cast<float>(k) - 69.0f) / 12.0f); current_freq = base_freq;
+        velocity = std::clamp(vel, 0.05f, 1.0f); env_stage = 0.0f;
+        if (!steal_smooth) { env = 0.0f; phase = 0.0f; sub_phase = 0.0f; last_out = 0.0f; svf.reset(); dc_x1 = 0.0f; dc_y1 = 0.0f; }
+        mod_engine = 0.0f; mod_morph_x = 0.0f; mod_chaos_y = 0.0f; mod_entangle = 0.0f; mod_plasma = 0.0f; mod_gravity = 0.0f; mod_cutoff = 0.0f; mod_res = 0.0f; mod_fmorph = 0.0f;
+        expr_pitch = 0.0f; expr_timbre = 0.0f; expr_pressure = 0.0f; expr_brightness = 0.0f; expr_volume = 1.0f; expr_pan = 0.5f;
+        for (int i = 0; i < CA_SIZE; ++i) cells[i] = rng.nextFloat();
+        for (int i = 0; i < 6; ++i) swarm_phases[i] = (rng.nextFloat() * 0.5f + 0.5f) * 2.0f * std::numbers::pi_v<float>;
+        lx = 0.1f + rng.nextFloat() * 0.05f; ly = 0.0f; lz = 0.0f; wg_last = 0.0f;
+        for (int i = 0; i < WG_SIZE; ++i) {
+            float window = 0.5f - 0.5f * std::cos(2.0f * std::numbers::pi_v<float> * static_cast<float>(i) / 128.0f);
+            delay_line[i] = (i < 128) ? (rng.nextFloat() * window * velocity) : 0.0f;
+        }
+        write_pos = 0; ap_state = 0.0f; lp_state = 0.0f; soliton_u = 0.4f + rng.nextFloat() * 0.1f; soliton_v = 0.0f; soliton_fold = 0.0f;
+    }
+};
+
+struct StereoSpaceDiffuser {
+    static constexpr int DL1 = 1493; static constexpr int DL2 = 2179; static constexpr int DL3 = 3187; static constexpr int DL4 = 4421;
+    std::array<float, DL1> buf1{}; std::array<float, DL2> buf2{}; std::array<float, DL3> buf3{}; std::array<float, DL4> buf4{};
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0; float lfo_phase = 0.0f; float dampL = 0.0f, dampR = 0.0f;
+    void reset() { buf1.fill(0.0f); buf2.fill(0.0f); buf3.fill(0.0f); buf4.fill(0.0f); i1 = i2 = i3 = i4 = 0; dampL = dampR = 0.0f; }
+    void process(float inL, float inR, float space_amt, float plasma_energy, float sr, float& outL, float& outR) {
+        if (space_amt <= 0.001f) { outL = inL; outR = inR; return; }
+        lfo_phase += (0.42f + plasma_energy * 0.8f) / sr; if (lfo_phase >= 1.0f) lfo_phase -= 1.0f;
+        float mod = std::sin(lfo_phase * 2.0f * std::numbers::pi_v<float>);
+        float d1 = buf1[i1]; float v1 = inL + d1 * 0.5f; buf1[i1] = v1; float apL = d1 - v1 * 0.5f; if (++i1 >= DL1) i1 = 0;
+        float d2 = buf2[i2]; float v2 = inR + d2 * 0.5f; buf2[i2] = v2; float apR = d2 - v2 * 0.5f; if (++i2 >= DL2) i2 = 0;
+        float fb = 0.36f + space_amt * 0.53f; float rL = buf3[i3]; float rR = buf4[i4];
+        float shimL = rL + 0.08f * space_amt * (2.0f * rL * rL - 0.15f); float shimR = rR + 0.08f * space_amt * (2.0f * rR * rR - 0.15f);
+        dampL = dampL * 0.34f + shimL * 0.66f; dampR = dampR * 0.34f + shimR * 0.66f;
+        buf3[i3] = std::tanh(apL + dampR * fb + mod * 0.0025f);
+        buf4[i4] = std::tanh(apR - dampL * fb - mod * 0.0025f);
+        if (++i3 >= DL3) i3 = 0; if (++i4 >= DL4) i4 = 0;
+        float wet = space_amt * 0.58f;
+        outL = inL * (1.0f - wet * 0.32f) + dampL * wet; outR = inR * (1.0f - wet * 0.32f) + dampR * wet;
+    }
 };
 
 struct TectonicPlugin {
-    clap_plugin_t plugin;
-    clap_plugin_descriptor_t descriptor;
-    clap_plugin_params_t params;
-    clap_plugin_audio_ports_t audio_ports;
-    clap_plugin_note_ports_t note_ports;
-    clap_plugin_voice_info_t voice_info;
-    clap_plugin_state_t state;
-    clap_plugin_gui_t gui;
+    const clap_host_t* host = nullptr;
+    float sample_rate = 48000.0f; uint64_t voice_counter = 0; FastRNG rng;
+    std::array<float, PARAM_COUNT> params{0.35f, 0.40f, 0.44f, 0.45f, 0.30f, 0.45f, 0.74f, 0.26f, 0.0f, 0.015f, 1.8f, 0.38f, 0.76f};
+    std::array<float, PARAM_COUNT> global_mod{};
+    std::array<Voice, MAX_VOICES> voices{};
+    QuantumEntanglementField qfield{};
+    StereoSpaceDiffuser diffuser{};
+    TectonicTelemetry telemetry{};
+    bool gui_is_open = false;
+#if defined(_WIN32)
+    HWND hwnd = nullptr;
+#elif defined(__APPLE__)
+    void* ns_view = nullptr;
+#else
+    Display* x11_display = nullptr; Window x11_window = 0;
+#endif
 
-    bool active = false;
-    double sample_rate = 44100.0;
-    uint32_t min_frames = 0;
-    uint32_t max_frames = 0;
-    double gain = 0.7;
-    double tune = 0.0;
+    static void sendNoteEnd(const clap_output_events_t* out_events, const Voice& v, uint32_t sample_time) {
+        if (!out_events || !out_events->try_push) return;
+        clap_event_note_t ev{}; ev.header.size = sizeof(clap_event_note_t); ev.header.time = sample_time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID; ev.header.type = CLAP_EVENT_NOTE_END;
+        ev.note_id = v.note_id; ev.port_index = v.port_index; ev.channel = v.channel; ev.key = v.key;
+        out_events->try_push(out_events, &ev.header);
+    }
+
+    void triggerNote(int32_t note_id, int16_t port, int16_t ch, int16_t key, float vel, uint32_t time, const clap_output_events_t* out_events) {
+        Voice* target = nullptr; bool stolen = false;
+        for (auto& v : voices) { if (!v.active) { target = &v; break; } }
+        if (!target) {
+            float min_env = 999.0f;
+            for (auto& v : voices) { if (!v.held && v.env < min_env) { min_env = v.env; target = &v; } }
+        }
+        if (!target) {
+            uint64_t oldest = UINT64_MAX;
+            for (auto& v : voices) { if (v.age < oldest) { oldest = v.age; target = &v; } }
+        }
+        if (target->active) { sendNoteEnd(out_events, *target, time); stolen = true; }
+        target->trigger(note_id, port, ch, key, vel, ++voice_counter, rng, stolen);
+    }
+
+    void handleEvent(const clap_event_header_t* hdr, const clap_output_events_t* out_events) {
+        if (hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
+        switch (hdr->type) {
+            case CLAP_EVENT_NOTE_ON: {
+                auto* ev = reinterpret_cast<const clap_event_note_t*>(hdr);
+                triggerNote(ev->note_id, ev->port_index, ev->channel, ev->key, static_cast<float>(ev->velocity), hdr->time, out_events);
+                break;
+            }
+            case CLAP_EVENT_NOTE_OFF:
+            case CLAP_EVENT_NOTE_CHOKE: {
+                auto* ev = reinterpret_cast<const clap_event_note_t*>(hdr);
+                for (auto& v : voices) {
+                    if (v.active && ((ev->note_id != -1 && v.note_id == ev->note_id) ||
+                        (ev->note_id == -1 && (ev->key == -1 || v.key == ev->key) && (ev->channel == -1 || v.channel == ev->channel)))) {
+                        v.held = false;
+                        if (hdr->type == CLAP_EVENT_NOTE_CHOKE) { v.active = false; v.env = 0.0f; sendNoteEnd(out_events, v, hdr->time); }
+                    }
+                }
+                break;
+            }
+            case CLAP_EVENT_PARAM_VALUE: {
+                auto* ev = reinterpret_cast<const clap_event_param_value_t*>(hdr);
+                if (ev->param_id < PARAM_COUNT) params[ev->param_id] = static_cast<float>(ev->value);
+                break;
+            }
+            case CLAP_EVENT_PARAM_MOD: {
+                auto* ev = reinterpret_cast<const clap_event_param_mod_t*>(hdr);
+                float amt = static_cast<float>(ev->amount);
+                if (ev->note_id != -1 || ev->key != -1 || ev->channel != -1) {
+                    for (auto& v : voices) {
+                        if (!v.active) continue;
+                        bool match = (ev->note_id != -1 && v.note_id == ev->note_id) ||
+                                     (ev->note_id == -1 && (ev->key == -1 || v.key == ev->key) && (ev->channel == -1 || v.channel == ev->channel));
+                        if (match) {
+                            switch (ev->param_id) {
+                                case PARAM_ENGINE_CONTINUUM: v.mod_engine = amt; break;
+                                case PARAM_MORPH_X:          v.mod_morph_x = amt; break;
+                                case PARAM_CHAOS_Y:          v.mod_chaos_y = amt; break;
+                                case PARAM_ENTANGLEMENT:     v.mod_entangle = amt; break;
+                                case PARAM_PLASMA_LENSING:   v.mod_plasma = amt; break;
+                                case PARAM_GRAVITY:          v.mod_gravity = amt; break;
+                                case PARAM_CUTOFF:           v.mod_cutoff = amt; break;
+                                case PARAM_RESONANCE:        v.mod_res = amt; break;
+                                case PARAM_FILTER_MORPH:     v.mod_fmorph = amt; break;
+                                default: break;
+                            }
+                        }
+                    }
+                } else if (ev->param_id < PARAM_COUNT) {
+                    global_mod[ev->param_id] = amt;
+                }
+                break;
+            }
+        }
+    }
+
+    static float evalChladniSmooth(float phase, float x_scaled, float y_scaled) {
+        constexpr float two_pi = 2.0f * std::numbers::pi_v<float>;
+        float n0 = 1.0f + std::floor(x_scaled); float fx = x_scaled - std::floor(x_scaled);
+        float m0 = 1.0f + std::floor(y_scaled); float fy = y_scaled - std::floor(y_scaled);
+        float cx = std::cos((n0) * phase * two_pi) * (1.0f - fx) + std::cos((n0 + 1.0f) * phase * two_pi) * fx;
+        float cy = std::cos((m0) * phase * two_pi) * (1.0f - fy) + std::cos((m0 + 1.0f) * phase * two_pi) * fy;
+        return 0.5f + 0.485f * (cx * cy);
+    }
+
+    float evalSingleEngine(Voice& v, int eng_id, float dt, float freq, float x, float y, float entangle, float plasma, float fundamental) {
+        constexpr float two_pi = 2.0f * std::numbers::pi_v<float>;
+        float peer_field_x = (qfield.active_count > 1) ? (qfield.field_x - v.last_out * 0.5f) / static_cast<float>(qfield.active_count - 1) : (v.last_out * 0.35f);
+        float peer_field_y = qfield.field_y;
+
+        if (eng_id == 0) {
+            v.ca_clock += dt * (0.35f + y * 3.8f + entangle * std::abs(peer_field_x) * 1.5f);
+            if (v.ca_clock >= 1.0f) {
+                v.ca_clock -= 1.0f;
+                float rule_gain = 1.65f + x * 2.4f + entangle * peer_field_y * 0.55f;
+                for (int i = 0; i < CA_SIZE; ++i) {
+                    float left = v.cells[(i - 1 + CA_SIZE) % CA_SIZE]; float center = v.cells[i]; float right = v.cells[(i + 1) % CA_SIZE];
+                    v.next_cells[i] = std::sin(((left + center + right) * 0.333333f + (left - 2.0f * center + right) * 0.25f * y) * rule_gain * std::numbers::pi_v<float> + 0.08f * std::sin(two_pi * (static_cast<float>(i)/CA_SIZE + v.phase)));
+                }
+                v.cells = v.next_cells;
+            }
+            float scan = evalChladniSmooth(v.phase, x * 4.99f, y * 4.99f);
+            float pos = scan * static_cast<float>(CA_SIZE - 1);
+            int idx0 = static_cast<int>(pos); int idx1 = (idx0 + 1) % CA_SIZE; float frac = pos - static_cast<float>(idx0);
+            return v.cells[idx0] * (1.0f - frac) + v.cells[idx1] * frac;
+        } else if (eng_id == 1) {
+            constexpr std::array<float, 6> ratios = {1.0f, 1.004f, 1.4983f, 1.997f, 2.618f, 3.992f};
+            float coupling_K = y * 0.22f; std::array<float, 6> next_phases = v.swarm_phases; float sum_out = 0.0f;
+            float global_angle = std::atan2(peer_field_y, peer_field_x + 1e-6f);
+            for (int i = 0; i < 6; ++i) {
+                float d_theta = two_pi * dt * (1.0f + (ratios[i] - 1.0f) * x);
+                float interaction = 0.0f;
+                for (int j = 0; j < 6; ++j) interaction += std::sin(v.swarm_phases[j] - v.swarm_phases[i]);
+                d_theta += (coupling_K / 6.0f) * interaction + entangle * 0.045f * std::sin(global_angle - v.swarm_phases[i]);
+                next_phases[i] += d_theta; if (next_phases[i] >= two_pi) next_phases[i] -= two_pi;
+                sum_out += std::sin(next_phases[i]);
+            }
+            v.swarm_phases = next_phases;
+            return std::tanh(sum_out * 0.48f);
+        } else if (eng_id == 2) {
+            float l_dt = std::min(dt * 0.18f * (0.4f + y * 2.2f), 0.015f);
+            float dx1 = 10.0f * (v.ly - v.lx); float dy1 = v.lx * ((24.0f + x * 14.0f) - v.lz) - v.ly; float dz1 = v.lx * v.ly - (8.0f/3.0f) * v.lz;
+            v.lx = 30.0f * std::tanh((v.lx + l_dt * dx1) / 30.0f); v.ly = 30.0f * std::tanh((v.ly + l_dt * dy1) / 30.0f); v.lz = std::clamp(v.lz + l_dt * dz1, 0.0f, 55.0f);
+            float folded = std::sin((fundamental + 0.35f * std::sin(v.phase * 4.0f * std::numbers::pi_v<float>)) * (1.0f + v.lx * 0.08f * y + x * 3.8f) * std::numbers::pi_v<float>);
+            v.wg_last = std::tanh(folded + v.wg_last * (0.25f + y * 0.52f));
+            return v.wg_last;
+        } else if (eng_id == 3) {
+            float exact_period = std::clamp(sample_rate / freq, 4.0f, static_cast<float>(WG_SIZE - 4));
+            int delay_int = static_cast<int>(exact_period); float frac = exact_period - static_cast<float>(delay_int);
+            float delayed = v.delay_line[(v.write_pos - delay_int + WG_SIZE) % WG_SIZE] * (1.0f - frac) + v.delay_line[(v.write_pos - delay_int - 1 + WG_SIZE) % WG_SIZE] * frac;
+            float ap_out = - (0.45f * (x - 0.5f)) * delayed + v.ap_state; v.ap_state = delayed + (0.45f * (x - 0.5f)) * ap_out;
+            v.lp_state = v.lp_state * (0.12f - x * 0.08f) + std::sin((ap_out + std::sin(v.phase * two_pi * 2.0f) * 0.1f) * (1.05f + y * 0.85f)) * (0.88f + x * 0.08f);
+            v.delay_line[v.write_pos] = std::tanh(v.lp_state * 0.996f); v.write_pos = (v.write_pos + 1) % WG_SIZE;
+            return v.lp_state;
+        } else {
+            float sech = 1.0f / std::cosh((v.phase - 0.5f) * (1.2f + x * 8.5f) * 2.5f);
+            float omega = two_pi * dt * (1.0f + std::floor(x * 4.0f) + y * 2.0f);
+            v.soliton_u = std::tanh(v.soliton_u + v.soliton_v * 0.35f);
+            v.soliton_v = std::tanh(v.soliton_v + (-omega * v.soliton_u * (1.0f + plasma * 0.8f * v.soliton_u * v.soliton_u) + omega * (sech * sech * 2.0f - 0.65f)) * 0.35f);
+            v.soliton_fold = 0.6f * std::sin((v.soliton_u * (1.2f + y * 2.5f) + (sech * sech * 2.0f - 0.65f)) * std::numbers::pi_v<float>) + 0.4f * v.soliton_fold;
+            return v.soliton_fold;
+        }
+    }
+
+    void renderVoice(Voice& v, float attack_sec, float decay_sec, uint32_t sample_time, const clap_output_events_t* out_events, float& outL, float& outR, float& sum_fx, float& sum_fy, float& sum_energy, float& sum_freq, int voice_idx) {
+        if (!v.active) return;
+        float eng_pos = std::clamp(params[PARAM_ENGINE_CONTINUUM] + global_mod[PARAM_ENGINE_CONTINUUM] + v.mod_engine * 4.0f, 0.0f, 4.0f);
+        float x = std::clamp(params[PARAM_MORPH_X] + global_mod[PARAM_MORPH_X] + v.mod_morph_x + v.expr_timbre * 0.5f, 0.0f, 1.0f);
+        float y = std::clamp(params[PARAM_CHAOS_Y] + global_mod[PARAM_CHAOS_Y] + v.mod_chaos_y + v.expr_pressure * 0.6f, 0.0f, 1.0f);
+        float entangle = std::clamp(params[PARAM_ENTANGLEMENT] + global_mod[PARAM_ENTANGLEMENT] + v.mod_entangle, 0.0f, 1.0f);
+        float plasma = std::clamp(params[PARAM_PLASMA_LENSING] + global_mod[PARAM_PLASMA_LENSING] + v.mod_plasma, 0.0f, 1.0f);
+        float grav = std::clamp(params[PARAM_GRAVITY] + global_mod[PARAM_GRAVITY] + v.mod_gravity, 0.0f, 1.0f);
+        float cutoff_norm = std::clamp(params[PARAM_CUTOFF] + global_mod[PARAM_CUTOFF] + v.mod_cutoff + v.expr_brightness * 0.4f + v.velocity * 0.15f, 0.0f, 1.0f);
+        float res_norm = std::clamp(params[PARAM_RESONANCE] + global_mod[PARAM_RESONANCE] + v.mod_res, 0.0f, 0.96f);
+        float fmorph = std::clamp(params[PARAM_FILTER_MORPH] + global_mod[PARAM_FILTER_MORPH] + v.mod_fmorph, 0.0f, 1.0f);
+
+        float target_freq = v.base_freq * std::pow(2.0f, v.expr_pitch / 12.0f);
+        if (qfield.active_count > 1 && plasma > 0.01f) {
+            float ratio = target_freq / std::max(20.0f, qfield.centroid_freq);
+            float harmonic_freq = qfield.centroid_freq * std::max(0.25f, std::round(ratio * 4.0f) * 0.25f);
+            target_freq *= (1.0f + (std::clamp(harmonic_freq / target_freq, 0.97f, 1.03f) - 1.0f) * plasma * 0.22f);
+        }
+        v.current_freq = std::clamp(target_freq, 16.0f, sample_rate * 0.45f);
+        float dt = v.current_freq / sample_rate;
+
+        v.phase += dt; if (v.phase >= 1.0f) v.phase -= 1.0f;
+        v.sub_phase += dt * 0.5f; if (v.sub_phase >= 1.0f) v.sub_phase -= 1.0f;
+
+        constexpr float two_pi = 2.0f * std::numbers::pi_v<float>;
+        float fundamental = std::sin(v.phase * two_pi);
+        float sub_octave = std::sin(v.sub_phase * two_pi);
+        float anchor = fundamental * 0.72f + sub_octave * 0.28f;
+
+        int eng0 = std::clamp(static_cast<int>(std::floor(eng_pos)), 0, 4);
+        int eng1 = std::min(eng0 + 1, 4);
+        float eng_frac = eng_pos - static_cast<float>(eng0);
+
+        float sig0 = evalSingleEngine(v, eng0, dt, v.current_freq, x, y, entangle, plasma, fundamental);
+        float raw_sig = sig0;
+        if (eng1 != eng0 && eng_frac > 0.001f) {
+            float sig1 = evalSingleEngine(v, eng1, dt, v.current_freq, x, y, entangle, plasma, fundamental);
+            raw_sig = sig0 * std::cos(eng_frac * 0.5f * std::numbers::pi_v<float>) + sig1 * std::sin(eng_frac * 0.5f * std::numbers::pi_v<float>);
+        }
+
+        if (qfield.active_count > 1 && plasma > 0.005f) {
+            float peer_sig = (qfield.field_x - v.last_out * 0.5f) / static_cast<float>(qfield.active_count - 1);
+            float plasma_ring = std::sin((raw_sig + peer_sig * (0.8f + y)) * std::numbers::pi_v<float>);
+            raw_sig = raw_sig * (1.0f - plasma * 0.42f) + plasma_ring * (plasma * 0.48f);
+        }
+
+        float dc_out = raw_sig - v.dc_x1 + 0.995f * v.dc_y1;
+        v.dc_x1 = raw_sig; v.dc_y1 = dc_out;
+
+        float mixed = dc_out * (1.0f - grav * 0.60f) + anchor * (grav * 0.85f);
+        float cutoff_hz = 40.0f * std::pow(450.0f, std::clamp(cutoff_norm + entangle * qfield.plasma_energy * 0.18f, 0.0f, 1.0f));
+        float filtered = v.svf.process(mixed, cutoff_hz, res_norm, fmorph, sample_rate);
+
+        if (v.env_stage < 0.5f) {
+            v.env += 1.0f / (std::max(0.0015f, attack_sec) * sample_rate);
+            if (v.env >= 1.0f) { v.env = 1.0f; v.env_stage = 1.0f; }
+        } else if (!v.held) {
+            v.env -= (1.0f / (std::max(0.04f, decay_sec) * sample_rate)) * (0.35f + 0.65f * v.env);
+            if (v.env <= 0.0001f) {
+                v.env = 0.0f; v.active = false; v.last_out = 0.0f;
+                sendNoteEnd(out_events, v, sample_time);
+                return;
+            }
+        }
+
+        float final_sig = filtered * v.env * v.velocity * v.expr_volume;
+        v.last_out = final_sig;
+
+        sum_fx += final_sig; sum_fy += std::cos(v.phase * two_pi) * v.env;
+        sum_energy += std::abs(final_sig); sum_freq += v.base_freq;
+
+        if (voice_idx >= 0 && voice_idx < MAX_VOICES) {
+            telemetry.voices[voice_idx] = {true, v.phase, v.env, eng_pos, x, y, std::clamp(0.5f + 0.22f * std::sin(static_cast<float>(v.key) * 1.3f), 0.05f, 0.95f), v.key};
+        }
+
+        float pan = std::clamp(0.5f + 0.22f * std::sin(static_cast<float>(v.key) * 1.3f) + (v.expr_pan - 0.5f), 0.05f, 0.95f);
+        outL += final_sig * std::cos(pan * 0.5f * std::numbers::pi_v<float>);
+        outR += final_sig * std::sin(pan * 0.5f * std::numbers::pi_v<float>);
+    }
 };
 
-TectonicPlugin *as_plugin(const clap_plugin_t *plugin) {
-    return reinterpret_cast<TectonicPlugin *>(const_cast<clap_plugin_t *>(plugin));
-}
-
-uint32_t clap_plugin_params_count(const clap_plugin_t *plugin) {
-    (void)plugin;
-    return 2;
-}
-
-bool clap_plugin_params_get_info(const clap_plugin_t *plugin, uint32_t param_index, clap_param_info_t *param_info) {
-    if (param_info == nullptr) {
-        return false;
-    }
-
-    if (param_index >= 2) {
-        return false;
-    }
-
-    const TectonicPlugin *self = as_plugin(plugin);
-    if (self == nullptr) {
-        return false;
-    }
-
-    const char *name = (param_index == kParamGain) ? "Gain" : "Tune";
-    const double min_value = (param_index == kParamGain) ? 0.0 : -12.0;
-    const double max_value = (param_index == kParamGain) ? 1.0 : 12.0;
-    const double default_value = (param_index == kParamGain) ? 0.7 : 0.0;
-    const clap_id id = (param_index == kParamGain) ? kParamGain : kParamTune;
-    const clap_param_info_flags flags = CLAP_PARAM_IS_AUTOMATABLE;
-
-    std::memset(param_info, 0, sizeof(*param_info));
-    param_info->id = id;
-    param_info->flags = flags;
-    param_info->cookie = nullptr;
-    std::snprintf(param_info->name, sizeof(param_info->name), "%s", name);
-    std::snprintf(param_info->module, sizeof(param_info->module), "%s", "Tectonic");
-    param_info->min_value = min_value;
-    param_info->max_value = max_value;
-    param_info->default_value = default_value;
+static uint32_t CLAP_ABI paramsCount(const clap_plugin_t*) { return PARAM_COUNT; }
+static bool CLAP_ABI paramsGetInfo(const clap_plugin_t*, uint32_t index, clap_param_info_t* info) {
+    if (index >= PARAM_COUNT) return false;
+    std::memset(info, 0, sizeof(clap_param_info_t));
+    info->id = index;
+    info->flags = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE | CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID;
+    const char* names[] = {
+        "4D Engine Continuum", "X: Structure & Morph", "Y: Chaos & Turbulence",
+        "Quantum Entanglement", "Plasma Bus & Lensing", "Gravity (Sub-Anchor)",
+        "Filter Cutoff", "Filter Resonance", "Filter Morph",
+        "Attack (sec)", "Release / Tail (sec)", "Abyssal Shimmer Space", "Master Gain"
+    };
+    std::snprintf(info->name, sizeof(info->name), "%s", names[index]);
+    info->max_value = (index == 0) ? 4.0 : ((index == 9 || index == 10) ? 5.0 : 1.0);
+    info->default_value = (index == 0) ? 0.35 : ((index == 1) ? 0.40 : ((index == 6) ? 0.74 : ((index == 11) ? 0.38 : ((index == 12) ? 0.76 : 0.45))));
     return true;
 }
-
-bool clap_plugin_params_get_value(const clap_plugin_t *plugin, clap_id param_id, double *out_value) {
-    if (out_value == nullptr) {
-        return false;
-    }
-
-    TectonicPlugin *self = as_plugin(plugin);
-    switch (param_id) {
-        case kParamGain:
-            *out_value = self->gain;
-            return true;
-        case kParamTune:
-            *out_value = self->tune;
-            return true;
-        default:
-            return false;
-    }
+static bool CLAP_ABI paramsGetValue(const clap_plugin_t* plugin, clap_id id, double* value) {
+    *value = static_cast<TectonicPlugin*>(plugin->plugin_data)->params[id];
+    return true;
 }
-
-bool clap_plugin_params_value_to_text(const clap_plugin_t *plugin, clap_id param_id, double value, char *out_buffer, uint32_t out_buffer_capacity) {
-    if (out_buffer == nullptr || out_buffer_capacity == 0) {
-        return false;
-    }
-
-    (void)plugin;
-    if (param_id == kParamGain) {
-        std::snprintf(out_buffer, out_buffer_capacity, "%.3f", value);
-        return true;
-    }
-    if (param_id == kParamTune) {
-        std::snprintf(out_buffer, out_buffer_capacity, "%.2f semitones", value);
-        return true;
-    }
-    return false;
+static bool CLAP_ABI paramsValueToText(const clap_plugin_t*, clap_id id, double value, char* display, uint32_t size) {
+    if (id == 0) std::snprintf(display, size, "%.2f [Engine]", value);
+    else std::snprintf(display, size, "%.2f", value);
+    return true;
 }
+static bool CLAP_ABI paramsTextToValue(const clap_plugin_t*, clap_id, const char* display, double* value) {
+    *value = std::atof(display);
+    return true;
+}
+static void CLAP_ABI paramsFlush(const clap_plugin_t* plugin, const clap_input_events_t* in, const clap_output_events_t* out) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    for (uint32_t i = 0; i < in->size(in); ++i) plug->handleEvent(in->get(in, i), out);
+}
+static const clap_plugin_params_t s_params_ext = { paramsCount, paramsGetInfo, paramsGetValue, paramsValueToText, paramsTextToValue, paramsFlush };
 
-bool clap_plugin_params_text_to_value(const clap_plugin_t *plugin, clap_id param_id, const char *param_value_text, double *out_value) {
-    if (param_value_text == nullptr || out_value == nullptr) {
-        return false;
-    }
+static bool CLAP_ABI stateSave(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    uint32_t magic = 0x54454334; stream->write(stream, &magic, sizeof(magic));
+    for (size_t i = 0; i < PARAM_COUNT; ++i) stream->write(stream, &plug->params[i], sizeof(float));
+    return true;
+}
+static bool CLAP_ABI stateLoad(const clap_plugin_t* plugin, const clap_istream_t* stream) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    uint32_t magic = 0; stream->read(stream, &magic, sizeof(magic));
+    if (magic != 0x54454334) return false;
+    for (size_t i = 0; i < PARAM_COUNT; ++i) stream->read(stream, &plug->params[i], sizeof(float));
+    return true;
+}
+static const clap_plugin_state_t s_state_ext = { stateSave, stateLoad };
 
-    char *parse_end = nullptr;
-    const double parsed = std::strtod(param_value_text, &parse_end);
-    if (parse_end == param_value_text) {
-        return false;
-    }
+static bool CLAP_ABI guiIsApiSupported(const clap_plugin_t*, const char* api, bool is_floating) {
+    if (is_floating) return false;
+#if defined(_WIN32)
+    return !std::strcmp(api, CLAP_WINDOW_API_WIN32);
+#elif defined(__APPLE__)
+    return !std::strcmp(api, CLAP_WINDOW_API_NS_VIEW);
+#else
+    return !std::strcmp(api, CLAP_WINDOW_API_X11);
+#endif
+}
+static bool CLAP_ABI guiGetPreferredApi(const clap_plugin_t*, const char** api, bool* is_floating) {
+    *is_floating = false;
+#if defined(_WIN32)
+    *api = CLAP_WINDOW_API_WIN32;
+#elif defined(__APPLE__)
+    *api = CLAP_WINDOW_API_NS_VIEW;
+#else
+    *api = CLAP_WINDOW_API_X11;
+#endif
+    return true;
+}
+static bool CLAP_ABI guiCreate(const clap_plugin_t* plugin, const char*, bool) { static_cast<TectonicPlugin*>(plugin->plugin_data)->gui_is_open = true; return true; }
+static void CLAP_ABI guiDestroy(const clap_plugin_t* plugin) { static_cast<TectonicPlugin*>(plugin->plugin_data)->gui_is_open = false; }
+static bool CLAP_ABI guiSetScale(const clap_plugin_t*, double) { return true; }
+static bool CLAP_ABI guiGetSize(const clap_plugin_t*, uint32_t* w, uint32_t* h) { *w = 960; *h = 600; return true; }
+static bool CLAP_ABI guiCanResize(const clap_plugin_t*) { return false; }
+static bool CLAP_ABI guiSetSize(const clap_plugin_t*, uint32_t, uint32_t) { return true; }
+static bool CLAP_ABI guiSetParent(const clap_plugin_t* plugin, const clap_window_t* window) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+#if defined(_WIN32)
+    plug->hwnd = static_cast<HWND>(window->win32);
+#elif defined(__APPLE__)
+    plug->ns_view = window->ns_view;
+#else
+    plug->x11_display = static_cast<Display*>(window->x11.display); plug->x11_window = static_cast<Window>(window->x11.window);
+#endif
+    return true;
+}
+static bool CLAP_ABI guiSetTransient(const clap_plugin_t*, const clap_window_t*) { return true; }
+static void CLAP_ABI guiSuggestTitle(const clap_plugin_t*, const char*) {}
+static bool CLAP_ABI guiShow(const clap_plugin_t*) { return true; }
+static bool CLAP_ABI guiHide(const clap_plugin_t*) { return true; }
+static const clap_plugin_gui_t s_gui_ext = { guiIsApiSupported, guiGetPreferredApi, guiCreate, guiDestroy, guiSetScale, guiGetSize, guiCanResize, guiSetSize, guiSetParent, guiSetTransient, guiSuggestTitle, guiShow, guiHide };
 
-    switch (param_id) {
-        case kParamGain:
-            if (parsed < 0.0 || parsed > 1.0) {
-                return false;
+static uint32_t CLAP_ABI audioPortsCount(const clap_plugin_t*, bool is_input) { return is_input ? 0 : 1; }
+static bool CLAP_ABI audioPortsGet(const clap_plugin_t*, uint32_t index, bool is_input, clap_audio_port_info_t* info) {
+    if (is_input || index > 0) return false;
+    info->id = 0; std::snprintf(info->name, sizeof(info->name), "Main Out");
+    info->channel_count = 2; info->flags = CLAP_AUDIO_PORT_IS_MAIN; info->port_type = CLAP_PORT_STEREO; info->in_place_pair = CLAP_INVALID_ID; return true;
+}
+static const clap_plugin_audio_ports_t s_audio_ports_ext = { audioPortsCount, audioPortsGet };
+
+static uint32_t CLAP_ABI notePortsCount(const clap_plugin_t*, bool is_input) { return is_input ? 1 : 0; }
+static bool CLAP_ABI notePortsGet(const clap_plugin_t*, uint32_t index, bool is_input, clap_note_port_info_t* info) {
+    if (!is_input || index > 0) return false;
+    info->id = 0; info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI | CLAP_NOTE_DIALECT_MIDI_MPE;
+    info->preferred_dialect = CLAP_NOTE_DIALECT_CLAP; std::snprintf(info->name, sizeof(info->name), "Note In"); return true;
+}
+static const clap_plugin_note_ports_t s_note_ports_ext = { notePortsCount, notePortsGet };
+static bool CLAP_ABI voiceInfoGet(const clap_plugin_t*, clap_voice_info_t* info) { info->voice_count = MAX_VOICES; info->voice_capacity = MAX_VOICES; info->flags = CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES; return true; }
+static const clap_plugin_voice_info_t s_voice_info_ext = { voiceInfoGet };
+
+static clap_process_status CLAP_ABI pluginProcess(const clap_plugin_t* plugin, const clap_process_t* process) {
+    auto* plug = static_cast<TectonicPlugin*>(plugin->plugin_data);
+    if (process->audio_outputs_count == 0 || !process->audio_outputs[0].data32) return CLAP_PROCESS_SLEEP;
+    float* outL = process->audio_outputs[0].data32[0]; float* outR = process->audio_outputs[0].channel_count > 1 ? process->audio_outputs[0].data32[1] : outL;
+    uint32_t ev_index = 0; const uint32_t num_events = process->in_events ? process->in_events->size(process->in_events) : 0;
+
+    for (uint32_t s = 0; s < process->frames_count; ++s) {
+        while (ev_index < num_events) {
+            const clap_event_header_t* hdr = process->in_events->get(process->in_events, ev_index);
+            if (hdr->time > s) break; plug->handleEvent(hdr, process->out_events); ev_index++;
+        }
+        float voicesL = 0.0f; float voicesR = 0.0f; float sum_fx = 0.0f, sum_fy = 0.0f, sum_energy = 0.0f, sum_freq = 0.0f; int active_cnt = 0;
+        for (int v = 0; v < MAX_VOICES; ++v) {
+            if (plug->voices[v].active) {
+                active_cnt++;
+                plug->renderVoice(plug->voices[v], std::clamp(plug->params[PARAM_ATTACK], 0.002f, 3.0f), std::clamp(plug->params[PARAM_DECAY], 0.05f, 8.0f), s, process->out_events, voicesL, voicesR, sum_fx, sum_fy, sum_energy, sum_freq, v);
+            } else {
+                plug->telemetry.voices[v].active = false;
             }
-            *out_value = parsed;
-            return true;
-        case kParamTune:
-            *out_value = parsed;
-            return true;
-        default:
-            return false;
+        }
+        plug->qfield.active_count = active_cnt;
+        if (active_cnt > 0) {
+            float inv_n = 1.0f / static_cast<float>(active_cnt);
+            plug->qfield.field_x = std::tanh(sum_fx * 0.6f); plug->qfield.field_y = std::tanh(sum_fy * inv_n);
+            plug->qfield.plasma_energy = plug->qfield.plasma_energy * 0.992f + (sum_energy * inv_n) * 0.008f;
+            plug->qfield.centroid_freq = plug->qfield.centroid_freq * 0.995f + (sum_freq * inv_n) * 0.005f;
+        } else {
+            plug->qfield.field_x *= 0.99f; plug->qfield.field_y *= 0.99f; plug->qfield.plasma_energy *= 0.99f;
+        }
+        float spacedL = 0.0f, spacedR = 0.0f;
+        plug->diffuser.process(voicesL, voicesR, std::clamp(plug->params[PARAM_SPACE], 0.0f, 1.0f), plug->qfield.plasma_energy, plug->sample_rate, spacedL, spacedR);
+        outL[s] = std::tanh(spacedL * std::clamp(plug->params[PARAM_GAIN], 0.0f, 1.0f));
+        if (outR != outL) outR[s] = std::tanh(spacedR * std::clamp(plug->params[PARAM_GAIN], 0.0f, 1.0f));
     }
-}
-
-void clap_plugin_params_flush(const clap_plugin_t *plugin, const clap_input_events_t *in, const clap_output_events_t *out) {
-    (void)plugin;
-    (void)in;
-    (void)out;
-}
-
-uint32_t clap_plugin_audio_ports_count(const clap_plugin_t *plugin, bool is_input) {
-    (void)plugin;
-    return is_input ? 0U : 1U;
-}
-
-bool clap_plugin_audio_ports_get(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_audio_port_info_t *info) {
-    if (info == nullptr) {
-        return false;
-    }
-
-    if (is_input || index != 0U) {
-        return false;
-    }
-
-    (void)plugin;
-    std::memset(info, 0, sizeof(*info));
-    info->id = 0;
-    std::snprintf(info->name, sizeof(info->name), "%s", "Main Output");
-    info->flags = CLAP_AUDIO_PORT_IS_MAIN;
-    info->channel_count = 2;
-    info->port_type = CLAP_PORT_STEREO;
-    info->in_place_pair = CLAP_INVALID_ID;
-    return true;
-}
-
-uint32_t clap_plugin_note_ports_count(const clap_plugin_t *plugin, bool is_input) {
-    (void)plugin;
-    return is_input ? 1U : 0U;
-}
-
-bool clap_plugin_note_ports_get(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_note_port_info_t *info) {
-    if (info == nullptr || !is_input || index != 0U) {
-        return false;
-    }
-
-    (void)plugin;
-    std::memset(info, 0, sizeof(*info));
-    info->id = 0;
-    info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI | CLAP_NOTE_DIALECT_MIDI_MPE;
-    info->preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
-    std::snprintf(info->name, sizeof(info->name), "%s", "Midi Input");
-    return true;
-}
-
-bool clap_plugin_voice_info_get(const clap_plugin_t *plugin, clap_voice_info_t *info) {
-    if (info == nullptr) {
-        return false;
-    }
-
-    (void)plugin;
-    info->voice_count = 64;
-    info->voice_capacity = 64;
-    info->flags = CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES;
-    return true;
-}
-
-bool clap_plugin_state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream) {
-    if (stream == nullptr || stream->write == nullptr) {
-        return false;
-    }
-
-    TectonicPlugin *self = as_plugin(plugin);
-    const double payload[2] = {self->gain, self->tune};
-    const int64_t written = stream->write(stream, payload, sizeof(payload));
-    return written == static_cast<int64_t>(sizeof(payload));
-}
-
-bool clap_plugin_state_load(const clap_plugin_t *plugin, const clap_istream_t *stream) {
-    if (stream == nullptr || stream->read == nullptr) {
-        return false;
-    }
-
-    TectonicPlugin *self = as_plugin(plugin);
-    double payload[2] = {0.0, 0.0};
-    const int64_t read = stream->read(stream, payload, sizeof(payload));
-    if (read != static_cast<int64_t>(sizeof(payload))) {
-        return false;
-    }
-
-    self->gain = payload[0];
-    self->tune = payload[1];
-    return true;
-}
-
-bool clap_plugin_gui_is_api_supported(const clap_plugin_t *plugin, const char *api, bool is_floating) {
-    (void)plugin;
-    (void)api;
-    (void)is_floating;
-    return false;
-}
-
-bool clap_plugin_gui_get_preferred_api(const clap_plugin_t *plugin, const char **api, bool *is_floating) {
-    (void)plugin;
-    (void)api;
-    (void)is_floating;
-    return false;
-}
-
-bool clap_plugin_gui_create(const clap_plugin_t *plugin, const char *api, bool is_floating) {
-    (void)plugin;
-    (void)api;
-    (void)is_floating;
-    return false;
-}
-
-void clap_plugin_gui_destroy(const clap_plugin_t *plugin) {
-    (void)plugin;
-}
-
-bool clap_plugin_gui_set_scale(const clap_plugin_t *plugin, double scale) {
-    (void)plugin;
-    (void)scale;
-    return false;
-}
-
-bool clap_plugin_gui_get_size(const clap_plugin_t *plugin, uint32_t *width, uint32_t *height) {
-    (void)plugin;
-    (void)width;
-    (void)height;
-    return false;
-}
-
-bool clap_plugin_gui_can_resize(const clap_plugin_t *plugin) {
-    (void)plugin;
-    return false;
-}
-
-bool clap_plugin_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uint32_t height) {
-    (void)plugin;
-    (void)width;
-    (void)height;
-    return false;
-}
-
-bool clap_plugin_gui_set_parent(const clap_plugin_t *plugin, const clap_window_t *window) {
-    (void)plugin;
-    (void)window;
-    return false;
-}
-
-bool clap_plugin_gui_set_transient(const clap_plugin_t *plugin, const clap_window_t *window) {
-    (void)plugin;
-    (void)window;
-    return false;
-}
-
-void clap_plugin_gui_suggest_title(const clap_plugin_t *plugin, const char *title) {
-    (void)plugin;
-    (void)title;
-}
-
-bool clap_plugin_gui_show(const clap_plugin_t *plugin) {
-    (void)plugin;
-    return false;
-}
-
-bool clap_plugin_gui_hide(const clap_plugin_t *plugin) {
-    (void)plugin;
-    return false;
-}
-
-bool clap_plugin_init(const clap_plugin_t *plugin) {
-    (void)plugin;
-    return true;
-}
-
-void clap_plugin_destroy(const clap_plugin_t *plugin) {
-    delete as_plugin(plugin);
-}
-
-bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate, uint32_t min_frames_count, uint32_t max_frames_count) {
-    TectonicPlugin *self = as_plugin(plugin);
-    self->active = true;
-    self->sample_rate = sample_rate;
-    self->min_frames = min_frames_count;
-    self->max_frames = max_frames_count;
-    return true;
-}
-
-void clap_plugin_deactivate(const clap_plugin_t *plugin) {
-    TectonicPlugin *self = as_plugin(plugin);
-    self->active = false;
-}
-
-bool clap_plugin_start_processing(const clap_plugin_t *plugin) {
-    (void)plugin;
-    return true;
-}
-
-void clap_plugin_stop_processing(const clap_plugin_t *plugin) {
-    (void)plugin;
-}
-
-void clap_plugin_reset(const clap_plugin_t *plugin) {
-    (void)plugin;
-}
-
-clap_process_status clap_plugin_process(const clap_plugin_t *plugin, const clap_process_t *process) {
-    (void)plugin;
-    (void)process;
     return CLAP_PROCESS_CONTINUE;
 }
 
-const void *clap_plugin_get_extension(const clap_plugin_t *plugin, const char *id) {
-    if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) {
-        return &as_plugin(plugin)->params;
-    }
-    if (std::strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) {
-        return &as_plugin(plugin)->audio_ports;
-    }
-    if (std::strcmp(id, CLAP_EXT_NOTE_PORTS) == 0) {
-        return &as_plugin(plugin)->note_ports;
-    }
-    if (std::strcmp(id, CLAP_EXT_VOICE_INFO) == 0) {
-        return &as_plugin(plugin)->voice_info;
-    }
-    if (std::strcmp(id, CLAP_EXT_STATE) == 0) {
-        return &as_plugin(plugin)->state;
-    }
-    if (std::strcmp(id, CLAP_EXT_GUI) == 0) {
-        return &as_plugin(plugin)->gui;
-    }
-    return nullptr;
-}
-
-void clap_plugin_on_main_thread(const clap_plugin_t *plugin) {
-    (void)plugin;
-}
-
-uint32_t clap_plugin_factory_get_plugin_count(const clap_plugin_factory *factory) {
-    (void)factory;
-    return 1U;
-}
-
-const clap_plugin_descriptor_t *clap_plugin_factory_get_plugin_descriptor(const clap_plugin_factory *factory, uint32_t index) {
-    static const clap_plugin_descriptor_t descriptor = {
-        CLAP_VERSION_INIT,
-        kPluginId,
-        kPluginName,
-        kVendor,
-        kUrl,
-        kManualUrl,
-        kSupportUrl,
-        kVersion,
-        kDescription,
-        kFeatures,
-    };
-
-    (void)factory;
-    if (index != 0U) {
-        return nullptr;
-    }
-    return &descriptor;
-}
-
-const clap_plugin_t *clap_plugin_factory_create_plugin(const clap_plugin_factory *factory, const clap_host_t *host, const char *plugin_id) {
-    (void)factory;
-    (void)host;
-    if (std::strcmp(plugin_id, kPluginId) != 0) {
-        return nullptr;
-    }
-
-    auto *plugin = new TectonicPlugin();
-    plugin->descriptor = {
-        CLAP_VERSION_INIT,
-        kPluginId,
-        kPluginName,
-        kVendor,
-        kUrl,
-        kManualUrl,
-        kSupportUrl,
-        kVersion,
-        kDescription,
-        kFeatures,
-    };
-
-    plugin->plugin.desc = &plugin->descriptor;
-    plugin->plugin.plugin_data = plugin;
-    plugin->plugin.init = clap_plugin_init;
-    plugin->plugin.destroy = clap_plugin_destroy;
-    plugin->plugin.activate = clap_plugin_activate;
-    plugin->plugin.deactivate = clap_plugin_deactivate;
-    plugin->plugin.start_processing = clap_plugin_start_processing;
-    plugin->plugin.stop_processing = clap_plugin_stop_processing;
-    plugin->plugin.reset = clap_plugin_reset;
-    plugin->plugin.process = clap_plugin_process;
-    plugin->plugin.get_extension = clap_plugin_get_extension;
-    plugin->plugin.on_main_thread = clap_plugin_on_main_thread;
-
-    plugin->params.count = clap_plugin_params_count;
-    plugin->params.get_info = clap_plugin_params_get_info;
-    plugin->params.get_value = clap_plugin_params_get_value;
-    plugin->params.value_to_text = clap_plugin_params_value_to_text;
-    plugin->params.text_to_value = clap_plugin_params_text_to_value;
-    plugin->params.flush = clap_plugin_params_flush;
-
-    plugin->audio_ports.count = clap_plugin_audio_ports_count;
-    plugin->audio_ports.get = clap_plugin_audio_ports_get;
-
-    plugin->note_ports.count = clap_plugin_note_ports_count;
-    plugin->note_ports.get = clap_plugin_note_ports_get;
-
-    plugin->voice_info.get = clap_plugin_voice_info_get;
-    plugin->state.save = clap_plugin_state_save;
-    plugin->state.load = clap_plugin_state_load;
-
-    plugin->gui.is_api_supported = clap_plugin_gui_is_api_supported;
-    plugin->gui.get_preferred_api = clap_plugin_gui_get_preferred_api;
-    plugin->gui.create = clap_plugin_gui_create;
-    plugin->gui.destroy = clap_plugin_gui_destroy;
-    plugin->gui.set_scale = clap_plugin_gui_set_scale;
-    plugin->gui.get_size = clap_plugin_gui_get_size;
-    plugin->gui.can_resize = clap_plugin_gui_can_resize;
-    plugin->gui.set_size = clap_plugin_gui_set_size;
-    plugin->gui.set_parent = clap_plugin_gui_set_parent;
-    plugin->gui.set_transient = clap_plugin_gui_set_transient;
-    plugin->gui.suggest_title = clap_plugin_gui_suggest_title;
-    plugin->gui.show = clap_plugin_gui_show;
-    plugin->gui.hide = clap_plugin_gui_hide;
-
-    return &plugin->plugin;
-}
-
-static const clap_plugin_factory_t g_plugin_factory = {
-    clap_plugin_factory_get_plugin_count,
-    clap_plugin_factory_get_plugin_descriptor,
-    clap_plugin_factory_create_plugin,
+static const char* const s_features[] = { CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUGIN_FEATURE_SYNTHESIZER, CLAP_PLUGIN_FEATURE_STEREO, nullptr };
+static const clap_plugin_descriptor_t s_descriptor = {
+    .clap_version = CLAP_VERSION_INIT, .id = "com.experimental.tectonic-synth",
+    .name = "Tectonic Experimental Synth v4", .vendor = "Experimental Audio Lab",
+    .url = "https://clapdb.org", .manual_url = "", .support_url = "", .version = "4.0.0",
+    .description = "Holographic Bio-Luminescent GUI, Quantum Entanglement & 4D Continuum Synth", .features = s_features
 };
 
-bool clap_entry_init(const char *plugin_path) {
-    (void)plugin_path;
-    return true;
+static bool CLAP_ABI pluginInit(const clap_plugin_t*) { return true; }
+static void CLAP_ABI pluginDestroy(const clap_plugin_t* p) { delete static_cast<TectonicPlugin*>(p->plugin_data); delete p; }
+static bool CLAP_ABI pluginActivate(const clap_plugin_t* p, double sr, uint32_t, uint32_t) {
+    auto* plug = static_cast<TectonicPlugin*>(p->plugin_data); plug->sample_rate = static_cast<float>(sr > 8000 ? sr : 48000); plug->qfield.reset(); plug->diffuser.reset(); return true;
 }
-
-void clap_entry_deinit() {
+static void CLAP_ABI pluginDeactivate(const clap_plugin_t*) {}
+static bool CLAP_ABI pluginStartProcessing(const clap_plugin_t*) { return true; }
+static void CLAP_ABI pluginStopProcessing(const clap_plugin_t*) {}
+static bool CLAP_ABI pluginReset(const clap_plugin_t* p) {
+    auto* plug = static_cast<TectonicPlugin*>(p->plugin_data); for (auto& v : plug->voices) v.active = false; plug->qfield.reset(); plug->diffuser.reset();
 }
-
-const void *clap_entry_get_factory(const char *factory_id) {
-    if (std::strcmp(factory_id, CLAP_PLUGIN_FACTORY_ID) == 0) {
-        return &g_plugin_factory;
-    }
+static const void* CLAP_ABI pluginGetExtension(const clap_plugin_t*, const char* id) {
+    if (!std::strcmp(id, CLAP_EXT_PARAMS)) return &s_params_ext;
+    if (!std::strcmp(id, CLAP_EXT_STATE)) return &s_state_ext;
+    if (!std::strcmp(id, CLAP_EXT_GUI)) return &s_gui_ext;
+    if (!std::strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &s_audio_ports_ext;
+    if (!std::strcmp(id, CLAP_EXT_NOTE_PORTS)) return &s_note_ports_ext;
+    if (!std::strcmp(id, CLAP_EXT_VOICE_INFO)) return &s_voice_info_ext;
     return nullptr;
 }
+static void CLAP_ABI pluginOnMainThread(const clap_plugin_t*) {}
 
-} // namespace
+static uint32_t CLAP_ABI factoryGetPluginCount(const clap_plugin_factory_t*) { return 1; }
+static const clap_plugin_descriptor_t* CLAP_ABI factoryGetPluginDescriptor(const clap_plugin_factory_t*, uint32_t idx) { return idx == 0 ? &s_descriptor : nullptr; }
+static const clap_plugin_t* CLAP_ABI factoryCreatePlugin(const clap_plugin_factory_t*, const clap_host_t* host, const char* id) {
+    if (!id || std::strcmp(id, s_descriptor.id) != 0) return nullptr;
+    auto* plug_data = new TectonicPlugin(); plug_data->host = host;
+    return new clap_plugin_t{ &s_descriptor, plug_data, pluginInit, pluginDestroy, pluginActivate, pluginDeactivate, pluginStartProcessing, pluginStopProcessing, pluginReset, pluginProcess, pluginGetExtension, pluginOnMainThread };
+}
+static const clap_plugin_factory_t s_factory = { factoryGetPluginCount, factoryGetPluginDescriptor, factoryCreatePlugin };
 
 extern "C" CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
-    CLAP_VERSION_INIT,
-    clap_entry_init,
-    clap_entry_deinit,
-    clap_entry_get_factory,
+    .clap_version = CLAP_VERSION_INIT,
+    .init = [](const char*) { return true; },
+    .deinit = []() {},
+    .get_factory = [](const char* fid) { return (fid && !std::strcmp(fid, CLAP_PLUGIN_FACTORY_ID)) ? &s_factory : nullptr; }
 };
-
