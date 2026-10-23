@@ -73,6 +73,8 @@ enum {
     CLAP_EVENT_NOTE_EXPRESSION = 4,
     CLAP_EVENT_PARAM_VALUE = 5,
     CLAP_EVENT_PARAM_MOD = 6,
+    CLAP_EVENT_PARAM_GESTURE_BEGIN = 7,
+    CLAP_EVENT_PARAM_GESTURE_END = 8,
     CLAP_EVENT_MIDI = 10
 };
 
@@ -124,6 +126,11 @@ typedef struct clap_event_param_value {
     int16_t key;
     double value;
 } clap_event_param_value_t;
+
+typedef struct clap_event_param_gesture {
+    clap_event_header_t header;
+    clap_id param_id;
+} clap_event_param_gesture_t;
 
 typedef struct clap_event_param_mod {
     clap_event_header_t header;
