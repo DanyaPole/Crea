@@ -826,6 +826,7 @@ struct GuiNoteMsg {
     float   velocity{0.85f};
     bool    note_on{true};
     bool    all_notes_off{false};
+    float   duration_sec{0.0f}; // > 0 means auto-release after duration_sec!
 };
 
 // Telemetry snapshot sent wait-free from Audio -> GUI @ 60 FPS
@@ -850,6 +851,7 @@ struct alignas(64) ObservatorySnapshot {
     bool     plasma_freeze_active{false};
     bool     bounce_recording{false};
     uint64_t bounce_frames_written{0};
+    std::array<float, 128> scope_wave{};
 };
 
 // ============================================================================
@@ -949,7 +951,7 @@ struct DualStreamBreathArbiter {
         last_cc11_frame = frame;
     }
 
-    float arbitrate(uint64_t current_frame, uint64_t hold_window_frames) const noexcept {
+    float arbitrate(uint64_t current_frame, uint64_t hold_window_frames) noexcept {
         if (last_cc2_frame > 0 && (current_frame - last_cc2_frame) <= hold_window_frames) {
             return val_cc2;
         }
@@ -959,6 +961,10 @@ struct DualStreamBreathArbiter {
         if (last_cc11_frame > 0 && (current_frame - last_cc11_frame) <= hold_window_frames) {
             return val_cc11;
         }
+        // Smoothly bleed off stale controller values so sound never hangs if controller disconnects
+        val_cc2  *= 0.92f;
+        val_at   *= 0.92f;
+        val_cc11 *= 0.92f;
         return std::max({val_cc2, val_at, val_cc11});
     }
 };
@@ -1624,6 +1630,7 @@ struct alignas(64) TectonicVoice {
     float     velocity{0.8f};
     float     virtual_lung_env{0.0f};
     bool      gate_on{false};
+    int32_t   remaining_gate_samples{0}; // >0 counts down to automatic Note Off
     float     note_tuning_semitones{0.0f};
     float     note_pressure{0.0f};
     float     target_freq_hz{261.625565f};
@@ -1640,6 +1647,7 @@ struct alignas(64) TectonicVoice {
         is_ghost_arp_voice = false;
         sustained_by_freeze = false;
         gate_on = false;
+        remaining_gate_samples = 0;
         virtual_lung_env = 0.0f;
         note_tuning_semitones = 0.0f;
         pitch_glide_smoother.configure(12.0f, sample_rate);
@@ -1960,14 +1968,29 @@ public:
             for (auto& v : voices_) {
                 if (!v.active) continue;
 
+                // Count down auto-gate timer for sequencer, arpeggiator, and preview notes
+                if (v.remaining_gate_samples > 0) {
+                    v.remaining_gate_samples -= static_cast<int32_t>(block_frames);
+                    if (v.remaining_gate_samples <= 0) {
+                        v.remaining_gate_samples = 0;
+                        v.gate_on = false;
+                    }
+                }
+
                 // Update Virtual Lung ADSR for keyboard / mouse playing
                 if (v.gate_on) {
-                    v.virtual_lung_env += 0.12f * (v.velocity - v.virtual_lung_env);
+                    v.virtual_lung_env += 0.18f * (v.velocity - v.virtual_lung_env);
                 } else if (!freeze_on && !v.sustained_by_freeze) {
-                    const float rel_factor = std::exp(-16.0f / ( std::max(0.08f, modal_decay * 0.35f) * sample_rate_ ));
+                    // Natural exponential release scaled by kParamModalDecay (0.05..4.0 sec)
+                    const float rel_time_sec = std::clamp(modal_decay * 0.22f, 0.04f, 2.50f);
+                    const float rel_factor = std::exp(-static_cast<float>(block_frames) / (rel_time_sec * sample_rate_));
                     v.virtual_lung_env *= rel_factor;
-                    if (v.virtual_lung_env < 0.0004f && target_breath < 0.001f) {
+                    if (v.virtual_lung_env < 0.0015f && target_breath < 0.002f) {
+                        v.virtual_lung_env = 0.0f;
                         v.active = false;
+                        v.waveguide.reset();
+                        v.modal_bank.reset();
+                        v.svf.reset();
                         continue;
                     }
                 }
@@ -2031,8 +2054,13 @@ public:
                     // 3. 64-Mode Resonator Bank (AVX2/FMA) + Loop A Symplectic Plasma Containment
                     const float modal_out = v.modal_bank.process_sample(dwg_out * 0.65f + mic_sample * 0.35f);
 
-                    // 4. Vadim Zavalishin TPT State Variable Filter
-                    const float voice_sig = v.svf.process(dwg_out * 0.45f + modal_out * 0.85f, svf_morph);
+                    // 4. Vadim Zavalishin TPT State Variable Filter + Amplitude VCA Envelope
+                    // Multiplying by vca_gain guarantees that once gate is off and breath is 0,
+                    // the voice decays to complete silence without endless waveguide self-oscillation!
+                    const float vca_gain = freeze_on
+                        ? 1.0f
+                        : clampf(v.virtual_lung_env * 1.25f + ramped_breath + mic_env, 0.0f, 1.0f);
+                    const float voice_sig = v.svf.process(dwg_out * 0.45f + modal_out * 0.85f, svf_morph) * vca_gain;
 
                     // Stereo spatialization across the 16 voices
                     const float pan = 0.15f + 0.70f * (static_cast<float>(vi) / static_cast<float>(kNumVoices - 1));
@@ -2040,23 +2068,17 @@ public:
                     mix_r += voice_sig * pan;
                 }
 
-                // Touch-canvas excitation from GUI Quantum Observatory
+                // Touch-canvas excitation from GUI Quantum Observatory (with instant release when mouse let go!)
                 if (canvas_touch_active_.load(std::memory_order_relaxed)) {
                     if (!voices_[0].active) {
                         voices_[0].active = true;
                         voices_[0].midi_key = 60;
                         voices_[0].target_freq_hz = 261.63f;
                         voices_[0].current_freq_hz = 261.63f;
-                        voices_[0].virtual_lung_env = 0.75f;
                     }
-                    const float exc = voices_[0].exciter.process(
-                        0.80f, 0.0f, reed_stiff, std::max(0.25f, jet_turb), 0.0f);
-                    const float dwg = voices_[0].waveguide.step(
-                        exc, sample_rate_ / std::max(voices_[0].current_freq_hz, 40.0f), 0.80f);
-                    const float mod = voices_[0].modal_bank.process_sample(dwg);
-                    const float flt = voices_[0].svf.process(dwg * 0.4f + mod * 0.9f, svf_morph);
-                    mix_l += flt * 0.7f;
-                    mix_r += flt * 0.7f;
+                    voices_[0].gate_on = true;
+                    voices_[0].remaining_gate_samples = static_cast<int32_t>(0.08f * sample_rate_);
+                    voices_[0].virtual_lung_env = 0.80f;
                 }
 
                 // Loop B Master Output Limiter: HilbertAnalyticalLimiter (C^2 smooth, zero 2*omega ripple)
@@ -2071,6 +2093,7 @@ public:
 
                 peak_l = std::max(peak_l, std::fabs(out_l));
                 peak_r = std::max(peak_r, std::fabs(out_r));
+                scope_ring_[steady_frame_counter_ & 127u] = 0.5f * (out_l + out_r);
 
                 // Live Take & Audio Bounce auto-threshold trigger & lock-free streaming
                 if (bounce_armed_.load(std::memory_order_relaxed) &&
@@ -2277,10 +2300,21 @@ public:
         chosen->pitch_glide_smoother.configure(glide_ms, sample_rate_);
         chosen->pitch_glide_smoother.reset(freq);
 
-        // Simulated tongue strike impulse on high-velocity keyboard Note On
-        if (velocity > 0.75f) {
-            chosen->virtual_lung_env = std::min(1.0f, velocity * 1.15f);
+        // If it's a ghost arp/sequencer voice, set automatic gate duration (180 ms) so it never hangs!
+        chosen->remaining_gate_samples = is_ghost_arp
+            ? static_cast<int32_t>(0.18f * sample_rate_)
+            : 0;
+
+        // Reuse existing voice if same midi_key is already active to prevent duplicate hanging voices
+        for (auto& v : voices_) {
+            if (&v != chosen && v.active && v.midi_key == key && v.channel == channel) {
+                v.gate_on = false;
+                v.remaining_gate_samples = 0;
+            }
         }
+
+        // Simulated tongue strike impulse on high-velocity keyboard Note On
+        chosen->virtual_lung_env = std::min(1.0f, std::max(0.35f, velocity));
     }
 
     void trigger_note_off(int16_t key, int16_t channel, int32_t note_id) noexcept {
@@ -2349,7 +2383,6 @@ public:
                 const float trig_beat = n.start_beat + static_cast<float>(r) * sub_dur;
                 if (trig_beat > prev_beat && trig_beat <= loop_beat) {
                     trigger_note_on(n.midi_key, n.velocity, 0, static_cast<int32_t>(1000 + i), true);
-                    breath_arbiter_.on_aftertouch(n.start_breath, steady_frame_counter_);
                 }
             }
         }
@@ -2466,6 +2499,7 @@ public:
         snap.plasma_freeze_active   = sustain_pedal_cc64_ || (get_param(kParamPlasmaFreeze) > 0.5f);
         snap.bounce_recording       = bounce_recording_.load(std::memory_order_relaxed);
         snap.bounce_frames_written  = bounce_frames_written_.load(std::memory_order_relaxed);
+        snap.scope_wave             = scope_ring_;
         telemetry_buffer_.publish();
     }
 
@@ -2488,11 +2522,16 @@ public:
     }
 
 // ============================================================================
-// SECTION VII-B: ПОЛНОСТЬЮ РУССКИЙ ИНТЕРАКТИВНЫЙ ИНТЕРФЕЙС + ЭКРАННОЕ ПИАНИНО
+// SECTION VII-B: 4 ВИЗУАЛЬНЫХ ИНТЕРФЕЙСА (СКИНА) + КАСТОМНЫЕ КРУТИЛКИ + ПИАНИНО
 // ============================================================================
+// 4 переключаемых визуальных интерфейса в реальном времени:
+//   - Интерфейс 0: «Квантовая Обсерватория» (Темный неон, 64 моды + XY-пэд плазмы)
+//   - Интерфейс 1: «Аналоговая Студия» (Теплая бронза/золото, большие круглые ручки-крутилки)
+//   - Интерфейс 2: «Кибер-Радар и Осциллограф» (Матричный изумруд, живая волна + полярный радар)
+//   - Интерфейс 3: «Чистая Сцена (Минимализм)» (Светлая контрастная тема, огромные макро-ручки)
 
-    void push_gui_note_event(int16_t key, float velocity, bool note_on, bool all_off = false) noexcept {
-        gui_note_queue_.try_push(GuiNoteMsg{key, velocity, note_on, all_off});
+    void push_gui_note_event(int16_t key, float velocity, bool note_on, bool all_off = false, float duration_sec = 0.0f) noexcept {
+        gui_note_queue_.try_push(GuiNoteMsg{key, velocity, note_on, all_off, duration_sec});
     }
 
     void drain_gui_note_queue() noexcept {
@@ -2501,48 +2540,175 @@ public:
             if (msg.all_notes_off) {
                 sustain_pedal_cc64_ = false;
                 set_param_atomic(kParamPlasmaFreeze, 0.0);
+                gui_manual_breath_.store(0.0f, std::memory_order_relaxed);
+                sensor_proc_.breath_filter.state = 0.0f;
                 for (auto& v : voices_) {
-                    v.gate_on = false;
-                    v.sustained_by_freeze = false;
-                    v.virtual_lung_env = 0.0f;
-                    v.active = false;
+                    v.reset(sample_rate_);
                 }
             } else if (msg.note_on) {
                 trigger_note_on(msg.key, msg.velocity, 0, -1, false);
+                if (msg.duration_sec > 0.0f) {
+                    for (auto& v : voices_) {
+                        if (v.active && v.midi_key == msg.key) {
+                            v.remaining_gate_samples = static_cast<int32_t>(msg.duration_sec * sample_rate_);
+                        }
+                    }
+                }
             } else {
                 trigger_note_off(msg.key, 0, -1);
             }
         }
     }
 
-    void apply_quantum_observatory_theme() noexcept {
+    // Применение цветовой палитры выбранного визуального интерфейса (0..3)
+    void apply_visual_skin_colors([[maybe_unused]] int skin_idx, [[maybe_unused]] float& out_bg_r, [[maybe_unused]] float& out_bg_g, [[maybe_unused]] float& out_bg_b) noexcept {
 #if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding    = 0.0f;
-        style.ChildRounding     = 8.0f;
-        style.FrameRounding     = 6.0f;
+        style.ChildRounding     = (skin_idx == 1) ? 10.0f : 7.0f;
+        style.FrameRounding     = (skin_idx == 1) ? 8.0f  : 5.0f;
         style.GrabRounding      = 5.0f;
-        style.PopupRounding     = 6.0f;
-        style.ScrollbarRounding = 6.0f;
         style.WindowBorderSize  = 0.0f;
         style.FrameBorderSize   = 1.0f;
-        style.ItemSpacing       = ImVec2(10.0f, 7.0f);
-        style.WindowPadding     = ImVec2(14.0f, 10.0f);
+        style.ItemSpacing       = ImVec2(9.0f, 6.0f);
+        style.WindowPadding     = ImVec2(12.0f, 9.0f);
 
-        ImVec4* colors = style.Colors;
-        colors[ImGuiCol_WindowBg]         = ImVec4(0.05f, 0.07f, 0.11f, 1.00f);
-        colors[ImGuiCol_ChildBg]          = ImVec4(0.08f, 0.12f, 0.19f, 0.96f);
-        colors[ImGuiCol_Border]           = ImVec4(0.22f, 0.46f, 0.66f, 0.65f);
-        colors[ImGuiCol_FrameBg]          = ImVec4(0.11f, 0.17f, 0.27f, 1.00f);
-        colors[ImGuiCol_FrameBgHovered]   = ImVec4(0.16f, 0.28f, 0.42f, 1.00f);
-        colors[ImGuiCol_FrameBgActive]    = ImVec4(0.22f, 0.40f, 0.58f, 1.00f);
-        colors[ImGuiCol_Button]           = ImVec4(0.13f, 0.26f, 0.40f, 1.00f);
-        colors[ImGuiCol_ButtonHovered]    = ImVec4(0.20f, 0.48f, 0.70f, 1.00f);
-        colors[ImGuiCol_ButtonActive]     = ImVec4(0.28f, 0.68f, 0.92f, 1.00f);
-        colors[ImGuiCol_SliderGrab]       = ImVec4(0.30f, 0.86f, 0.98f, 1.00f);
-        colors[ImGuiCol_SliderGrabActive] = ImVec4(0.98f, 0.75f, 0.25f, 1.00f);
-        colors[ImGuiCol_CheckMark]        = ImVec4(0.30f, 0.90f, 0.98f, 1.00f);
-        colors[ImGuiCol_Text]             = ImVec4(0.94f, 0.97f, 1.00f, 1.00f);
+        ImVec4* c = style.Colors;
+        if (skin_idx == 0) {
+            // 0: Квантовая Обсерватория (Глубокий синий космос + голубой неон)
+            out_bg_r = 0.04f; out_bg_g = 0.06f; out_bg_b = 0.10f;
+            c[ImGuiCol_WindowBg]       = ImVec4(0.04f, 0.06f, 0.10f, 1.00f);
+            c[ImGuiCol_ChildBg]        = ImVec4(0.07f, 0.11f, 0.18f, 0.96f);
+            c[ImGuiCol_Border]         = ImVec4(0.20f, 0.48f, 0.68f, 0.65f);
+            c[ImGuiCol_FrameBg]        = ImVec4(0.10f, 0.16f, 0.26f, 1.00f);
+            c[ImGuiCol_FrameBgHovered] = ImVec4(0.15f, 0.26f, 0.40f, 1.00f);
+            c[ImGuiCol_FrameBgActive]  = ImVec4(0.20f, 0.36f, 0.54f, 1.00f);
+            c[ImGuiCol_Button]         = ImVec4(0.12f, 0.25f, 0.38f, 1.00f);
+            c[ImGuiCol_ButtonHovered]  = ImVec4(0.18f, 0.45f, 0.68f, 1.00f);
+            c[ImGuiCol_ButtonActive]   = ImVec4(0.25f, 0.65f, 0.90f, 1.00f);
+            c[ImGuiCol_SliderGrab]     = ImVec4(0.28f, 0.86f, 0.98f, 1.00f);
+            c[ImGuiCol_SliderGrabActive]=ImVec4(0.98f, 0.76f, 0.24f, 1.00f);
+            c[ImGuiCol_Text]           = ImVec4(0.93f, 0.97f, 1.00f, 1.00f);
+        } else if (skin_idx == 1) {
+            // 1: Аналоговая Студия (Теплый винтажный орех, бронза и янтарное золото)
+            out_bg_r = 0.11f; out_bg_g = 0.08f; out_bg_b = 0.06f;
+            c[ImGuiCol_WindowBg]       = ImVec4(0.11f, 0.08f, 0.06f, 1.00f);
+            c[ImGuiCol_ChildBg]        = ImVec4(0.16f, 0.12f, 0.09f, 0.97f);
+            c[ImGuiCol_Border]         = ImVec4(0.65f, 0.46f, 0.22f, 0.70f);
+            c[ImGuiCol_FrameBg]        = ImVec4(0.22f, 0.16f, 0.11f, 1.00f);
+            c[ImGuiCol_FrameBgHovered] = ImVec4(0.32f, 0.23f, 0.15f, 1.00f);
+            c[ImGuiCol_FrameBgActive]  = ImVec4(0.42f, 0.30f, 0.18f, 1.00f);
+            c[ImGuiCol_Button]         = ImVec4(0.34f, 0.22f, 0.12f, 1.00f);
+            c[ImGuiCol_ButtonHovered]  = ImVec4(0.55f, 0.36f, 0.16f, 1.00f);
+            c[ImGuiCol_ButtonActive]   = ImVec4(0.78f, 0.52f, 0.20f, 1.00f);
+            c[ImGuiCol_SliderGrab]     = ImVec4(0.95f, 0.68f, 0.22f, 1.00f);
+            c[ImGuiCol_SliderGrabActive]=ImVec4(1.00f, 0.84f, 0.38f, 1.00f);
+            c[ImGuiCol_Text]           = ImVec4(0.98f, 0.93f, 0.84f, 1.00f);
+        } else if (skin_idx == 2) {
+            // 2: Кибер-Радар и Осциллограф (Черный карбон + изумрудный радар и пурпур)
+            out_bg_r = 0.02f; out_bg_g = 0.05f; out_bg_b = 0.04f;
+            c[ImGuiCol_WindowBg]       = ImVec4(0.02f, 0.05f, 0.04f, 1.00f);
+            c[ImGuiCol_ChildBg]        = ImVec4(0.04f, 0.09f, 0.07f, 0.96f);
+            c[ImGuiCol_Border]         = ImVec4(0.15f, 0.82f, 0.48f, 0.65f);
+            c[ImGuiCol_FrameBg]        = ImVec4(0.06f, 0.15f, 0.11f, 1.00f);
+            c[ImGuiCol_FrameBgHovered] = ImVec4(0.10f, 0.26f, 0.18f, 1.00f);
+            c[ImGuiCol_FrameBgActive]  = ImVec4(0.14f, 0.38f, 0.26f, 1.00f);
+            c[ImGuiCol_Button]         = ImVec4(0.08f, 0.24f, 0.16f, 1.00f);
+            c[ImGuiCol_ButtonHovered]  = ImVec4(0.14f, 0.46f, 0.28f, 1.00f);
+            c[ImGuiCol_ButtonActive]   = ImVec4(0.20f, 0.72f, 0.42f, 1.00f);
+            c[ImGuiCol_SliderGrab]     = ImVec4(0.22f, 0.96f, 0.56f, 1.00f);
+            c[ImGuiCol_SliderGrabActive]=ImVec4(0.96f, 0.28f, 0.78f, 1.00f);
+            c[ImGuiCol_Text]           = ImVec4(0.86f, 1.00f, 0.92f, 1.00f);
+        } else {
+            // 3: Чистая Сцена / Минимализм (Светлая студийная тема с высоким контрастом)
+            out_bg_r = 0.91f; out_bg_g = 0.93f; out_bg_b = 0.96f;
+            c[ImGuiCol_WindowBg]       = ImVec4(0.91f, 0.93f, 0.96f, 1.00f);
+            c[ImGuiCol_ChildBg]        = ImVec4(0.97f, 0.98f, 1.00f, 1.00f);
+            c[ImGuiCol_Border]         = ImVec4(0.62f, 0.68f, 0.76f, 0.85f);
+            c[ImGuiCol_FrameBg]        = ImVec4(0.83f, 0.87f, 0.92f, 1.00f);
+            c[ImGuiCol_FrameBgHovered] = ImVec4(0.76f, 0.82f, 0.90f, 1.00f);
+            c[ImGuiCol_FrameBgActive]  = ImVec4(0.68f, 0.76f, 0.88f, 1.00f);
+            c[ImGuiCol_Button]         = ImVec4(0.78f, 0.83f, 0.90f, 1.00f);
+            c[ImGuiCol_ButtonHovered]  = ImVec4(0.55f, 0.70f, 0.92f, 1.00f);
+            c[ImGuiCol_ButtonActive]   = ImVec4(0.35f, 0.58f, 0.88f, 1.00f);
+            c[ImGuiCol_SliderGrab]     = ImVec4(0.16f, 0.44f, 0.82f, 1.00f);
+            c[ImGuiCol_SliderGrabActive]=ImVec4(0.88f, 0.42f, 0.12f, 1.00f);
+            c[ImGuiCol_Text]           = ImVec4(0.10f, 0.14f, 0.20f, 1.00f);
+        }
+#endif
+    }
+
+    void apply_quantum_observatory_theme() noexcept {
+        float r = 0.0f, g = 0.0f, b = 0.0f;
+        apply_visual_skin_colors(gui_visual_theme_, r, g, b);
+    }
+
+    // Отрисовка настоящей круглой студийной ручки-крутилки (Rotary Knob) с поддержкой мыши и MIDI Learn
+    bool draw_rotary_knob([[maybe_unused]] const char* label, [[maybe_unused]] clap_id pid, [[maybe_unused]] float radius = 34.0f) noexcept {
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        ImGui::BeginGroup();
+        ImGui::PushID(static_cast<int>(pid));
+
+        const auto& info = param_infos_[pid];
+        const float min_v = static_cast<float>(info.min_value);
+        const float max_v = static_cast<float>(info.max_value);
+        float val = get_param(pid);
+        float norm = clampf((val - min_v) / std::max(max_v - min_v, 1e-5f), 0.0f, 1.0f);
+
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
+        const float box_w = radius * 2.4f;
+        const float box_h = radius * 2.1f;
+
+        ImGui::InvisibleButton("RotaryKnobBtn", ImVec2(box_w, box_h));
+        bool changed = false;
+        if (ImGui::IsItemActive()) {
+            const ImVec2 delta = ImGui::GetIO().MouseDelta;
+            const float step = (-delta.y + delta.x * 0.5f) * 0.0065f;
+            if (std::fabs(step) > 1e-6f) {
+                norm = clampf(norm + step, 0.0f, 1.0f);
+                val = min_v + norm * (max_v - min_v);
+                push_gui_param_change(pid, val);
+                changed = true;
+            }
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            midi_learn_target_param_.store(static_cast<int32_t>(pid), std::memory_order_release);
+        }
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 center(pos.x + box_w * 0.5f, pos.y + radius + 2.0f);
+
+        const float a_min = 0.75f * kPi;
+        const float a_max = 2.25f * kPi;
+        const float a_val = a_min + norm * (a_max - a_min);
+
+        const ImU32 dial_bg = (gui_visual_theme_ == 3) ? IM_COL32(215, 222, 232, 255) : IM_COL32(28, 24, 22, 255);
+        const ImU32 arc_col = (gui_visual_theme_ == 1)
+            ? IM_COL32(245, 175, 55, 255)
+            : ((gui_visual_theme_ == 2) ? IM_COL32(45, 245, 145, 255) : IM_COL32(65, 210, 250, 255));
+
+        dl->AddCircleFilled(center, radius, dial_bg, 36);
+        dl->AddCircle(center, radius, IM_COL32(120, 110, 95, 190), 36, 2.0f);
+
+        // Дуга значения
+        dl->PathArcTo(center, radius - 4.0f, a_min, a_val, 28);
+        dl->PathStroke(arc_col, 0, 3.8f);
+
+        // Стрелка-указатель
+        const ImVec2 tip(center.x + std::cos(a_val) * (radius - 7.0f),
+                         center.y + std::sin(a_val) * (radius - 7.0f));
+        dl->AddLine(center, tip, arc_col, 3.0f);
+        dl->AddCircleFilled(center, 4.0f, arc_col, 12);
+
+        char val_txt[32];
+        std::snprintf(val_txt, sizeof(val_txt), "%.2f", val);
+        ImGui::Text("%s: %s", label, val_txt);
+
+        ImGui::PopID();
+        ImGui::EndGroup();
+        return changed;
+#else
+        return false;
 #endif
     }
 
@@ -2552,33 +2718,32 @@ public:
         ImGui::BeginChild("OnScreenPianoChild", ImVec2(width, height), true,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-        // Верхняя полоска быстрых кнопок над клавишами
-        ImGui::TextColored(ImVec4(0.30f, 0.88f, 0.98f, 1.0f),
-                           "ЭКРАННАЯ КЛАВИАТУРА (Кликай и води мышкой по клавишам или играй на клавиатуре ПК Z..M / Q..U):");
+        ImGui::Text("ЭКРАННОЕ ПИАНИНО (Кликай мышкой или играй клавишами ПК Z..M / Q..I):");
         ImGui::SameLine();
-        if (ImGui::Button("Аккорд C-min")) {
-            push_gui_note_event(60, 0.88f, true);
-            push_gui_note_event(63, 0.85f, true);
-            push_gui_note_event(67, 0.85f, true);
-            push_gui_note_event(72, 0.82f, true);
+        if (ImGui::Button("Аккорд C-min (Авто-затухание)")) {
+            // Запускаем аккорд с автоматическим отпусканием через 0.9 сек, чтобы он красиво затух сам!
+            push_gui_note_event(60, 0.88f, true, false, 0.90f);
+            push_gui_note_event(63, 0.85f, true, false, 0.90f);
+            push_gui_note_event(67, 0.85f, true, false, 0.90f);
+            push_gui_note_event(72, 0.82f, true, false, 0.90f);
         }
         ImGui::SameLine();
         bool freeze_now = get_param(kParamPlasmaFreeze) > 0.5f;
         if (freeze_now) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
-        if (ImGui::Button(freeze_now ? "ЗАМОРОЗКА АККОРДА: ВКЛ" : "Заморозить звук (Дрон)")) {
+        if (ImGui::Button(freeze_now ? "ДРОН (ЗАМОРОЗКА): ВКЛ" : "Удерживать Дрон (Freeze)")) {
             push_gui_param_change(kParamPlasmaFreeze, freeze_now ? 0.0 : 1.0);
         }
         if (freeze_now) ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.16f, 0.16f, 1.0f));
-        if (ImGui::Button("СТОП ВСЕ НОТЫ (Паника)")) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
+        if (ImGui::Button("СБРОС ЗВУКА (ТИШИНА)")) {
             gui_seq_playing_.store(false, std::memory_order_relaxed);
             push_gui_param_change(kParamArpEnable, 0.0);
             push_gui_note_event(0, 0.0f, false, true);
         }
         ImGui::PopStyleColor();
 
-        // Компьютерная клавиатура (QWERTY) для игры без мыши
+        // Компьютерная клавиатура (QWERTY)
         struct KeyMap { ImGuiKey key; int16_t note; };
         static constexpr KeyMap kPcKeys[] = {
             {ImGuiKey_Z, 48}, {ImGuiKey_S, 49}, {ImGuiKey_X, 50}, {ImGuiKey_D, 51},
@@ -2601,14 +2766,13 @@ public:
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 avail = ImGui::GetContentRegionAvail();
         const float kb_w = std::max(avail.x, 200.0f);
-        const float kb_h = std::max(avail.y, 60.0f);
+        const float kb_h = std::max(avail.y, 55.0f);
 
         ImGui::InvisibleButton("PianoKeysSurface", ImVec2(kb_w, kb_h));
         const bool surf_hovered = ImGui::IsItemHovered();
         const bool mouse_down   = ImGui::IsMouseDown(ImGuiMouseButton_Left);
         const ImVec2 mp         = ImGui::GetIO().MousePos;
 
-        // 3 октавы: от C3 (48) до B5 (83) -> 21 белая клавиша
         static constexpr int kStartNote = 48;
         static constexpr int kNumWhiteKeys = 21;
         static constexpr int kWhiteOffsets[7] = {0, 2, 4, 5, 7, 9, 11};
@@ -2617,12 +2781,10 @@ public:
         const float black_h = kb_h * 0.60f;
 
         int hovered_note = -1;
-
-        // 1. Сначала проверяем попадание мыши в черные клавиши (они поверх белых)
         if (surf_hovered) {
             for (int oct = 0; oct < 3; ++oct) {
                 for (int w = 0; w < 7; ++w) {
-                    if (w == 2 || w == 6) continue; // между E-F и B-C черной клавиши нет
+                    if (w == 2 || w == 6) continue;
                     const int white_idx = oct * 7 + w;
                     const float bx0 = p0.x + (static_cast<float>(white_idx) + 1.0f) * white_w - black_w * 0.5f;
                     const float bx1 = bx0 + black_w;
@@ -2631,14 +2793,13 @@ public:
                     }
                 }
             }
-            // 2. Если не попали в черную — определяем белую клавишу
             if (hovered_note == -1) {
                 const int w_idx = std::clamp(static_cast<int>((mp.x - p0.x) / white_w), 0, kNumWhiteKeys - 1);
                 hovered_note = kStartNote + (w_idx / 7) * 12 + kWhiteOffsets[w_idx % 7];
             }
         }
 
-        // Обработка нажатия и скольжения (глиссандо) мышкой по клавишам
+        // Гарантированное отпускание ноты, как только отпущена кнопка мыши или курсор ушел с клавиатуры!
         const int wanted_note = (surf_hovered && mouse_down) ? hovered_note : -1;
         if (wanted_note != gui_held_mouse_note_) {
             if (gui_held_mouse_note_ != -1) {
@@ -2651,11 +2812,10 @@ public:
             gui_held_mouse_note_ = wanted_note;
         }
 
-        // Проверяем, какие ноты сейчас звучат в движке, чтобы подсвечивать клавиши
         auto is_note_sounding = [&](int midi_note) -> bool {
             if (gui_held_mouse_note_ == midi_note) return true;
             for (const auto& v : voices_) {
-                if (v.active && v.midi_key == midi_note && v.virtual_lung_env > 0.02f) return true;
+                if (v.active && v.midi_key == midi_note && v.virtual_lung_env > 0.03f) return true;
             }
             return false;
         };
@@ -2663,7 +2823,6 @@ public:
         ImDrawList* dl = ImGui::GetWindowDrawList();
         static constexpr const char* kNoteNamesRu[7] = {"До", "Ре", "Ми", "Фа", "Соль", "Ля", "Си"};
 
-        // Отрисовка белых клавиш
         for (int oct = 0; oct < 3; ++oct) {
             for (int w = 0; w < 7; ++w) {
                 const int white_idx = oct * 7 + w;
@@ -2689,7 +2848,6 @@ public:
             }
         }
 
-        // Отрисовка черных клавиш
         for (int oct = 0; oct < 3; ++oct) {
             for (int w = 0; w < 7; ++w) {
                 if (w == 2 || w == 6) continue;
@@ -2716,200 +2874,129 @@ public:
         step_gui_frame_60fps(1.0f / 60.0f);
 
 #if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        float bg_r = 0.04f, bg_g = 0.06f, bg_b = 0.10f;
+        apply_visual_skin_colors(gui_visual_theme_, bg_r, bg_g, bg_b);
+
         const float w_f = static_cast<float>(gui_width_);
         const float h_f = static_cast<float>(gui_height_);
 
         ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(w_f, h_f));
-        ImGui::Begin("Tectonic Synth v5.1 — Русский Интерфейс", nullptr,
+        ImGui::Begin("Tectonic Synth v5.2 — Мульти-Интерфейс", nullptr,
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                      ImGuiWindowFlags_NoBringToFrontOnFocus);
 
         // ====================================================================
-        // 1. ВЕРХНЯЯ ПАНЕЛЬ: ПОНЯТНЫЕ ПРЕСЕТЫ ЗВУКА В 1 КЛИК И ИНДИКАТОР ВЫХОДА
+        // СТРОКА 1: ВЫБОР ОДНОГО ИЗ 4 ВИЗУАЛЬНЫХ ИНТЕРФЕЙСОВ (СКИНОВ)
         // ====================================================================
-        ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.98f, 1.0f),
-                           "TECTONIC SYNTH v5.1 — ФИЗИЧЕСКИЙ СИНТЕЗАТОР");
+        ImGui::Text("ВИЗУАЛЬНЫЙ ИНТЕРФЕЙС:");
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.96f, 0.78f, 0.28f, 1.0f), "  Быстрый выбор тембра:");
+        auto skin_btn = [&](const char* title, int idx) {
+            const bool sel = (gui_visual_theme_ == idx);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.88f, 0.55f, 0.15f, 1.0f));
+            if (ImGui::Button(title)) {
+                gui_visual_theme_ = idx;
+            }
+            if (sel) ImGui::PopStyleColor();
+        };
+        skin_btn("Вид 1: Квантовый Неон (Спектр + Пэд)", 0);
+        ImGui::SameLine();
+        skin_btn("Вид 2: Аналоговая Студия (Крутилки)", 1);
+        ImGui::SameLine();
+        skin_btn("Вид 3: Кибер-Радар и Осциллограф", 2);
+        ImGui::SameLine();
+        skin_btn("Вид 4: Чистая Сцена (Минимализм)", 3);
+
+        // ====================================================================
+        // СТРОКА 2: БЫСТРЫЕ ТЕМБРЫ (С АВТОМАТИЧЕСКИМ ЗАТУХАНИЕМ!)
+        // ====================================================================
+        ImGui::Text("Готовые тембры (послушать):");
         ImGui::SameLine();
         if (ImGui::Button("1. Медная труба / Саксофон")) {
             push_gui_param_change(kParamMaterialMorph, 0.02);
             push_gui_param_change(kParamPlasmaDrive, 0.55);
-            push_gui_param_change(kParamModalDecay, 1.80);
+            push_gui_param_change(kParamModalDecay, 1.20);
             push_gui_param_change(kParamSvfCutoffHz, 4800.0);
             push_gui_param_change(kParamSvfMorph, 0.05);
-            push_gui_note_event(60, 0.90f, true);
+            push_gui_note_event(60, 0.90f, true, false, 0.65f);
         }
         ImGui::SameLine();
         if (ImGui::Button("2. Каменный Базальт (Бас)")) {
             push_gui_param_change(kParamMaterialMorph, 0.36);
             push_gui_param_change(kParamPlasmaDrive, 0.82);
-            push_gui_param_change(kParamModalDecay, 3.50);
+            push_gui_param_change(kParamModalDecay, 1.50);
             push_gui_param_change(kParamSvfCutoffHz, 1800.0);
             push_gui_param_change(kParamSvfMorph, 0.0);
-            push_gui_note_event(48, 0.95f, true);
+            push_gui_note_event(48, 0.95f, true, false, 0.75f);
         }
         ImGui::SameLine();
         if (ImGui::Button("3. Лесная Флейта / Дерево")) {
             push_gui_param_change(kParamMaterialMorph, 0.66);
             push_gui_param_change(kParamJetTurbulence, 0.48);
-            push_gui_param_change(kParamModalDecay, 1.20);
+            push_gui_param_change(kParamModalDecay, 0.95);
             push_gui_param_change(kParamSvfCutoffHz, 3600.0);
-            push_gui_note_event(67, 0.85f, true);
+            push_gui_note_event(67, 0.85f, true, false, 0.60f);
         }
         ImGui::SameLine();
         if (ImGui::Button("4. Кварцевый Космос")) {
             push_gui_param_change(kParamMaterialMorph, 0.98);
             push_gui_param_change(kParamPlasmaDrive, 0.90);
-            push_gui_param_change(kParamModalDecay, 7.50);
+            push_gui_param_change(kParamModalDecay, 2.40);
             push_gui_param_change(kParamSvfCutoffHz, 9500.0);
-            push_gui_note_event(60, 0.85f, true);
-            push_gui_note_event(67, 0.85f, true);
-            push_gui_note_event(74, 0.85f, true);
+            push_gui_note_event(60, 0.85f, true, false, 1.10f);
+            push_gui_note_event(67, 0.85f, true, false, 1.10f);
+            push_gui_note_event(74, 0.85f, true, false, 1.10f);
         }
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.45f, 0.98f, 0.55f, 1.0f),
-                           " Выход L/R: %.2f / %.2f",
-                           last_gui_snapshot_.master_peak_l,
-                           last_gui_snapshot_.master_peak_r);
+        ImGui::Text(" | Уровень L/R: %.2f / %.2f",
+                    last_gui_snapshot_.master_peak_l,
+                    last_gui_snapshot_.master_peak_r);
 
         // ====================================================================
-        // 2. ПЕРЕКЛЮЧАТЕЛЬ 4 РЕЖИМОВ РАБОТЫ (КРУПНЫЕ ПОНЯТНЫЕ ВКЛАДКИ)
+        // СТРОКА 3: ВКЛАДКИ ФУНКЦИЙ (СИНТЕЗ / СЕКВЕНСОР / МИДИ / ЗАПИСЬ WAV)
         // ====================================================================
         const int cur_mode = std::clamp(static_cast<int>(std::lround(get_param(kParamUiMode))), 0, 3);
         auto mode_tab = [&](const char* label, int idx) {
             const bool active = (cur_mode == idx);
-            if (active) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.58f, 0.86f, 1.0f));
-            }
-            if (ImGui::Button(label, ImVec2((w_f - 58.0f) * 0.25f, 32.0f))) {
+            if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.58f, 0.86f, 1.0f));
+            if (ImGui::Button(label, ImVec2((w_f - 58.0f) * 0.25f, 30.0f))) {
                 push_gui_param_change(kParamUiMode, static_cast<double>(idx));
             }
-            if (active) {
-                ImGui::PopStyleColor();
-            }
+            if (active) ImGui::PopStyleColor();
         };
 
-        mode_tab("РЕЖИМ 1: ГЛАВНЫЙ СИНТЕЗАТОР И ПЭД", 3);
+        mode_tab("ВКЛАДКА 1: ИГРА И ТЕМБР", 3);
         ImGui::SameLine();
-        mode_tab("РЕЖИМ 2: ПОШАГОВЫЙ СЕКВЕНСОР (МЕЛОДИЯ)", 0);
+        mode_tab("ВКЛАДКА 2: МЕЛОДИЯ (СЕКВЕНСОР)", 0);
         ImGui::SameLine();
-        mode_tab("РЕЖИМ 3: ПРИВЯЗКА MIDI-КРУТИЛОК", 1);
+        mode_tab("ВКЛАДКА 3: ПРИВЯЗКА MIDI", 1);
         ImGui::SameLine();
-        mode_tab("РЕЖИМ 4: ЗАПИСЬ ЗВУКА В WAV", 2);
+        mode_tab("ВКЛАДКА 4: ЗАПИСЬ В WAV", 2);
 
         ImGui::Separator();
 
-        // Вычисляем высоту центральной зоны так, чтобы внизу всегда помещалась экранная клавиатура (155 px)
-        const float piano_h = 155.0f;
-        const float center_h = std::max(220.0f, ImGui::GetContentRegionAvail().y - piano_h - 8.0f);
+        const float piano_h = 150.0f;
+        const float center_h = std::max(210.0f, ImGui::GetContentRegionAvail().y - piano_h - 8.0f);
 
-        // ====================================================================
-        // 3. ЛЕВАЯ ИНТЕРАКТИВНАЯ ЗОНА (МЕНЯЕТСЯ В ЗАВИСИМОСТИ ОТ ВЫБРАННОГО РЕЖИМА)
-        // ====================================================================
-        ImGui::BeginChild("LeftInteractiveZone", ImVec2(w_f * 0.56f, center_h), true);
-        {
-            // ----------------------------------------------------------------
-            // РЕЖИМ 1 (cur_mode == 3): ГЛАВНЫЙ СИНТЕЗАТОР, XY-ПЭД ПЛАЗМЫ И ДАТЧИКИ
-            // ----------------------------------------------------------------
-            if (cur_mode == 3) {
-                ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.25f, 1.0f),
-                                   "ИНТЕРАКТИВНЫЙ XY-ПЭД ПЛАЗМЫ (Зажми левую кнопку мыши и води по полю — сразу зазвучит!):");
-
-                const ImVec2 pad_p0 = ImGui::GetCursorScreenPos();
-                const ImVec2 avail  = ImGui::GetContentRegionAvail();
-                const float pad_h   = std::max(140.0f, avail.y - 125.0f);
-                const ImVec2 pad_sz(avail.x, pad_h);
-                const ImVec2 pad_p1(pad_p0.x + pad_sz.x, pad_p0.y + pad_sz.y);
-
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                dl->AddRectFilledMultiColor(
-                    pad_p0, pad_p1,
-                    IM_COL32(12, 22, 38, 255), IM_COL32(28, 48, 72, 255),
-                    IM_COL32(20, 36, 58, 255), IM_COL32(10, 16, 28, 255));
-
-                ImGui::InvisibleButton("MainXYPlasmaPad", pad_sz);
-                const bool pad_active = ImGui::IsItemActive();
-                canvas_touch_active_.store(pad_active, std::memory_order_relaxed);
-
-                if (pad_active && pad_sz.x > 1.0f && pad_sz.y > 1.0f) {
-                    const ImVec2 mp = ImGui::GetIO().MousePos;
-                    const float nx = clampf((mp.x - pad_p0.x) / pad_sz.x, 0.0f, 1.0f);
-                    const float ny = clampf(1.0f - (mp.y - pad_p0.y) / pad_sz.y, 0.0f, 1.0f);
-                    push_gui_param_change(kParamMaterialMorph, nx);
-                    push_gui_param_change(kParamPlasmaDrive, ny);
-                    push_gui_param_change(kParamSvfCutoffHz, 250.0 + ny * 12000.0);
-                }
-
-                // Отрисовка 64 живых гармоник (мод) прямо на XY-пэде
-                const float bar_w = pad_sz.x / static_cast<float>(kNumModes);
-                for (uint32_t k = 0; k < kNumModes; ++k) {
-                    const float ek = clampf(std::sqrt(last_gui_snapshot_.modal_energies[k]) * 4.0f, 0.0f, 1.0f);
-                    const float xl = pad_p0.x + static_cast<float>(k) * bar_w;
-                    const float yt = pad_p1.y - ek * (pad_sz.y - 20.0f);
-                    dl->AddRectFilled(ImVec2(xl + 1.0f, yt), ImVec2(xl + bar_w - 1.0f, pad_p1.y),
-                                      IM_COL32(65, 220, 255, 200), 2.0f);
-                }
-
-                // Перекрестие текущей позиции Материала (X) и Яркости Плазмы (Y)
-                const float cx = pad_p0.x + get_param(kParamMaterialMorph) * pad_sz.x;
-                const float cy = pad_p1.y - get_param(kParamPlasmaDrive) * pad_sz.y;
-                dl->AddLine(ImVec2(cx, pad_p0.y), ImVec2(cx, pad_p1.y), IM_COL32(255, 200, 60, 180), 1.5f);
-                dl->AddLine(ImVec2(pad_p0.x, cy), ImVec2(pad_p1.x, cy), IM_COL32(255, 200, 60, 180), 1.5f);
-                dl->AddCircleFilled(ImVec2(cx, cy), 8.0f, IM_COL32(255, 190, 50, 255));
-                dl->AddText(ImVec2(pad_p0.x + 10.0f, pad_p0.y + 8.0f), IM_COL32(235, 245, 255, 240),
-                            "Ось X (влево-вправо): Материал (Медь -> Камень -> Дерево -> Кварц) | Ось Y (вверх-вниз): Накачка и Фильтр");
-
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.98f, 1.0f), "УПРАВЛЕНИЕ ДЫХАНИЕМ И АВТО-РИТМОМ (ДЛЯ ИГРЫ МЫШКОЙ):");
-
-                float manual_b = gui_manual_breath_.load(std::memory_order_relaxed);
-                if (ImGui::SliderFloat("Постоянная подача воздуха (Дыхание без контроллера)", &manual_b, 0.0f, 1.0f, "%.2f")) {
-                    gui_manual_breath_.store(manual_b, std::memory_order_relaxed);
-                }
-
+        // Если мы не на вкладке 1 (например, открыт Секвенсор, MIDI или Запись WAV), показываем их:
+        if (cur_mode != 3) {
+            ImGui::BeginChild("SpecialModeWorkspace", ImVec2(0.0f, center_h), true);
+            if (cur_mode == 0) {
+                // ВКЛАДКА 2: ПОШАГОВЫЙ СЕКВЕНСОР
+                ImGui::Text("ПОШАГОВЫЙ 8-НОТНЫЙ СЕКВЕНСОР (Кликай и рисуй мышкой по столбикам!):");
                 bool seq_on = gui_seq_playing_.load(std::memory_order_relaxed);
                 if (seq_on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.68f, 0.32f, 1.0f));
-                if (ImGui::Button(seq_on ? "АВТО-МЕЛОДИЯ СЕКВЕНСОРА: ИГРАЕТ (Нажми для Стоп)"
-                                         : "ЗАПУСТИТЬ АВТО-МЕЛОДИЮ (Играет сама!)")) {
+                if (ImGui::Button(seq_on ? "ОСТАНОВИТЬ МЕЛОДИЮ" : "ЗАПУСТИТЬ МЕЛОДИЮ СЕКВЕНСОРА")) {
                     gui_seq_playing_.store(!seq_on, std::memory_order_relaxed);
+                    if (seq_on) push_gui_note_event(0, 0.0f, false, true);
                 }
                 if (seq_on) ImGui::PopStyleColor();
-
                 ImGui::SameLine();
-                if (ImGui::Button("Калибровка нуля датчика AE-30")) {
-                    auto_zero_calibrate_requested_.store(true, std::memory_order_release);
-                }
-            }
-            // ----------------------------------------------------------------
-            // РЕЖИМ 2 (cur_mode == 0): ПОШАГОВЫЙ СЕКВЕНСОР (КЛИКАЙ ПО ШАГАМ МЫШКОЙ)
-            // ----------------------------------------------------------------
-            else if (cur_mode == 0) {
-                ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.25f, 1.0f),
-                                   "ПОШАГОВЫЙ 8-НОТНЫЙ СЕКВЕНСОР (Кликай по столбикам, чтобы менять ноты на лету!):");
-
-                bool seq_on = gui_seq_playing_.load(std::memory_order_relaxed);
-                if (seq_on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.68f, 0.32f, 1.0f));
-                if (ImGui::Button(seq_on ? "ОСТАНОВИТЬ СЕКВЕНСОР" : "ЗАПУСТИТЬ СЕКВЕНСОР ПРЯМО СЕЙЧАС")) {
-                    gui_seq_playing_.store(!seq_on, std::memory_order_relaxed);
-                }
-                if (seq_on) ImGui::PopStyleColor();
-
-                ImGui::SameLine();
-                if (ImGui::Button("Сдвинуть мелодию на +1 полутон вверх")) {
+                if (ImGui::Button("Транспонировать +1 полутон")) {
                     auto& arena = pattern_rcu_.gui_begin_edit();
                     for (uint32_t i = 0; i < arena.note_count; ++i) {
                         arena.notes[i].midi_key = static_cast<int16_t>(48 + ((arena.notes[i].midi_key - 47) % 24));
-                    }
-                    pattern_rcu_.gui_commit_edit();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Добавить дробление (Ratchet) шагу 1")) {
-                    auto& arena = pattern_rcu_.gui_begin_edit();
-                    if (arena.note_count > 0) {
-                        arena.notes[0].ratchet_count = static_cast<uint8_t>((arena.notes[0].ratchet_count % 4) + 1);
                     }
                     pattern_rcu_.gui_commit_edit();
                 }
@@ -2920,9 +3007,9 @@ public:
                 if (gsz.x > 40.0f && gsz.y > 40.0f) {
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     const ImVec2 gp1(gp0.x + gsz.x, gp0.y + gsz.y);
-                    dl->AddRectFilled(gp0, gp1, IM_COL32(10, 16, 26, 255), 6.0f);
+                    dl->AddRectFilled(gp0, gp1, IM_COL32(14, 20, 32, 255), 6.0f);
 
-                    ImGui::InvisibleButton("SequencerInteractiveGrid", gsz);
+                    ImGui::InvisibleButton("SeqGridBtn", gsz);
                     if (ImGui::IsItemActive()) {
                         const ImVec2 mp = ImGui::GetIO().MousePos;
                         const int step = std::clamp(static_cast<int>(((mp.x - gp0.x) / gsz.x) * 8.0f), 0, 7);
@@ -2933,7 +3020,7 @@ public:
                         if (step < static_cast<int>(edit.note_count) && edit.notes[step].midi_key != new_key) {
                             edit.notes[step].midi_key = new_key;
                             pattern_rcu_.gui_commit_edit();
-                            push_gui_note_event(new_key, 0.85f, true);
+                            push_gui_note_event(new_key, 0.85f, true, false, 0.25f);
                         } else {
                             pattern_rcu_.gui_commit_edit();
                         }
@@ -2942,39 +3029,31 @@ public:
                     const float col_w = gsz.x / 8.0f;
                     for (int i = 0; i < 8; ++i) {
                         const float x0 = gp0.x + static_cast<float>(i) * col_w;
-                        dl->AddLine(ImVec2(x0, gp0.y), ImVec2(x0, gp1.y), IM_COL32(45, 70, 100, 150));
+                        dl->AddLine(ImVec2(x0, gp0.y), ImVec2(x0, gp1.y), IM_COL32(60, 85, 115, 150));
                         if (i < static_cast<int>(pat.note_count)) {
                             const auto& n = pat.notes[i];
                             const float yn = clampf(static_cast<float>(n.midi_key - 48) / 24.0f, 0.05f, 0.95f);
                             const float y_bar = gp1.y - yn * (gsz.y - 24.0f);
-                            dl->AddRectFilled(ImVec2(x0 + 6.0f, y_bar), ImVec2(x0 + col_w - 6.0f, gp1.y - 4.0f),
-                                              IM_COL32(60, 200, 245, 220), 4.0f);
+                            dl->AddRectFilled(ImVec2(x0 + 8.0f, y_bar), ImVec2(x0 + col_w - 8.0f, gp1.y - 4.0f),
+                                              IM_COL32(65, 210, 250, 225), 5.0f);
                             char s_lbl[32];
                             std::snprintf(s_lbl, sizeof(s_lbl), "Шаг %d (Нота %d)", i + 1, n.midi_key);
-                            dl->AddText(ImVec2(x0 + 8.0f, y_bar - 18.0f), IM_COL32(255, 230, 120, 255), s_lbl);
+                            dl->AddText(ImVec2(x0 + 12.0f, y_bar - 18.0f), IM_COL32(255, 220, 90, 255), s_lbl);
                         }
                     }
                 }
-            }
-            // ----------------------------------------------------------------
-            // РЕЖИМ 3 (cur_mode == 1): ПРИВЯЗКА MIDI-КРУТИЛОК (MIDI LEARN)
-            // ----------------------------------------------------------------
-            else if (cur_mode == 1) {
-                ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.25f, 1.0f),
-                                   "БЫСТРАЯ ПРИВЯЗКА ЛЮБОЙ КРУТИЛКИ К МИДИ-КОНТРОЛЛЕРУ (MIDI LEARN):");
+            } else if (cur_mode == 1) {
+                // ВКЛАДКА 3: ПРИВЯЗКА MIDI
+                ImGui::Text("ПРИВЯЗКА MIDI-КОНТРОЛЛЕРА В 1 КЛИК:");
                 const int32_t armed = midi_learn_target_param_.load(std::memory_order_relaxed);
                 if (armed >= 0 && armed < static_cast<int32_t>(kParamCount)) {
-                    ImGui::TextColored(ImVec4(0.30f, 0.98f, 0.55f, 1.0f),
-                                       ">>> ОЖИДАНИЕ MIDI: Поверни любую ручку или полоску на контроллере для параметра [%s] <<<",
-                                       param_infos_[armed].name);
-                    if (ImGui::Button("Отменить ожидание MIDI")) {
+                    ImGui::Text(">>> ОЖИДАНИЕ MIDI: Поверни ручку на контроллере для [%s] <<<",
+                                param_infos_[armed].name);
+                    if (ImGui::Button("Отмена")) {
                         midi_learn_target_param_.store(-1, std::memory_order_release);
                     }
-                } else {
-                    ImGui::TextWrapped("Как привязать: нажми кнопку [Привязать MIDI] напротив нужного параметра и поверни ручку на клавиатуре или аэрофоне.");
                 }
                 ImGui::Separator();
-
                 for (uint32_t pid = 2; pid < kParamCount; ++pid) {
                     ImGui::PushID(static_cast<int>(pid));
                     if (ImGui::Button("Привязать MIDI")) {
@@ -2989,96 +3068,211 @@ public:
                     }
                     ImGui::PopID();
                 }
-            }
-            // ----------------------------------------------------------------
-            // РЕЖИМ 4 (cur_mode == 2): ЗАПИСЬ ЗВУКА В WAV (МАГНИТОФОН ДУБЛЕЙ)
-            // ----------------------------------------------------------------
-            else if (cur_mode == 2) {
-                ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.25f, 1.0f),
-                                   "ВСТРОЕННЫЙ МАГНИТОФОН (ЗАПИСЬ ИГРЫ В 32-BIT FLOAT WAV):");
-                ImGui::TextWrapped("Записывает все, что ты играешь в плагине, в чистый аудиофайл с автоматической меткой темпа для Bitwig Studio.");
-                ImGui::Spacing();
-
+            } else if (cur_mode == 2) {
+                // ВКЛАДКА 4: ЗАПИСЬ В WAV
+                ImGui::Text("ЗАПИСЬ ИГРЫ В WAV-ФАЙЛ (32-BIT FLOAT):");
                 bool is_rec = bounce_recording_.load(std::memory_order_relaxed);
-                if (is_rec) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
-                if (ImGui::Button(is_rec ? "ИДЕТ ЗАПИСЬ... (Нажми для паузы)" : "НАЧАТЬ ЗАПИСЬ ЗВУКА", ImVec2(260.0f, 36.0f))) {
+                if (ImGui::Button(is_rec ? "ОСТАНОВИТЬ ЗАПИСЬ" : "НАЧАТЬ ЗАПИСЬ", ImVec2(240.0f, 38.0f))) {
                     bounce_recording_.store(!is_rec, std::memory_order_release);
                 }
-                if (is_rec) ImGui::PopStyleColor();
-
                 ImGui::SameLine();
-                if (ImGui::Button("СОХРАНИТЬ WAV-ФАЙЛ НА ДИСК", ImVec2(260.0f, 36.0f))) {
+                if (ImGui::Button("СОХРАНИТЬ WAV НА ДИСК", ImVec2(240.0f, 38.0f))) {
                     trigger_save_live_take_wav("");
                 }
-
-                bool armed = bounce_armed_.load(std::memory_order_relaxed);
-                if (ImGui::Checkbox("Автоматически включать запись при появлении звука", &armed)) {
-                    bounce_armed_.store(armed, std::memory_order_release);
-                }
-
-                ImGui::Separator();
                 const double sec = static_cast<double>(last_gui_snapshot_.bounce_frames_written) / std::max(sample_rate_, 1.0f);
-                ImGui::Text("Записано времени: %.2f сек (%llu сэмплов)",
-                            sec, static_cast<unsigned long long>(last_gui_snapshot_.bounce_frames_written));
+                ImGui::Text("Записано: %.2f сек", sec);
                 if (!last_take_wav_path_.empty()) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Файл сохранен: %s", last_take_wav_path_.c_str());
+                    ImGui::Text("Файл: %s", last_take_wav_path_.c_str());
                 }
             }
+            ImGui::EndChild();
         }
-        ImGui::EndChild();
-
-        ImGui::SameLine();
-
         // ====================================================================
-        // 4. ПРАВАЯ СТОЙКА: ПОНЯТНЫЕ РУССКИЕ КРУТИЛКИ ТЕМБРА (ВСЕГДА ПОД РУКОЙ)
+        // ЕСЛИ ОТКРЫТА ВКЛАДКА 1 ("ИГРА И ТЕМБР") — РИСУЕМ ВЫБРАННЫЙ ВИЗУАЛЬНЫЙ ИНТЕРФЕЙС (0..3)!
         // ====================================================================
-        ImGui::BeginChild("RightRussianControls", ImVec2(0.0f, center_h), true);
-        {
-            ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.98f, 1.0f),
-                               "НАСТРОЙКА ЗВУКА (Покрути во время игры — слышно сразу!):");
-            ImGui::Separator();
+        else {
+            // ----------------------------------------------------------------
+            // ВИД 1 (gui_visual_theme_ == 0): КВАНТОВЫЙ НЕОН (XY-ПЭД ПЛАЗМЫ + ПОЛЗУНКИ)
+            // ----------------------------------------------------------------
+            if (gui_visual_theme_ == 0) {
+                ImGui::BeginChild("NeonLeft", ImVec2(w_f * 0.55f, center_h), true);
+                ImGui::Text("XY-ПЭД ПЛАЗМЫ (Зажми мышку и води — отпустишь, и звук плавно затухнет!):");
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const ImVec2 sz(avail.x, std::max(120.0f, avail.y - 75.0f));
+                const ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
 
-            auto slider_ru = [&](clap_id pid, const char* label_ru) {
-                float v = get_param(pid);
-                if (ImGui::SliderFloat(label_ru, &v,
-                                       static_cast<float>(param_infos_[pid].min_value),
-                                       static_cast<float>(param_infos_[pid].max_value))) {
-                    push_gui_param_change(pid, v);
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilledMultiColor(p0, p1,
+                    IM_COL32(10, 20, 36, 255), IM_COL32(24, 48, 76, 255),
+                    IM_COL32(18, 36, 60, 255), IM_COL32(8, 14, 24, 255));
+
+                ImGui::InvisibleButton("NeonXYPad", sz);
+                const bool pad_down = ImGui::IsItemActive();
+                canvas_touch_active_.store(pad_down, std::memory_order_relaxed);
+                if (pad_down && sz.x > 1.0f && sz.y > 1.0f) {
+                    const ImVec2 mp = ImGui::GetIO().MousePos;
+                    const float nx = clampf((mp.x - p0.x) / sz.x, 0.0f, 1.0f);
+                    const float ny = clampf(1.0f - (mp.y - p0.y) / sz.y, 0.0f, 1.0f);
+                    push_gui_param_change(kParamMaterialMorph, nx);
+                    push_gui_param_change(kParamPlasmaDrive, ny);
+                    push_gui_param_change(kParamSvfCutoffHz, 250.0 + ny * 12000.0);
                 }
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-                    midi_learn_target_param_.store(static_cast<int32_t>(pid), std::memory_order_release);
+
+                const float bw = sz.x / static_cast<float>(kNumModes);
+                for (uint32_t k = 0; k < kNumModes; ++k) {
+                    const float ek = clampf(std::sqrt(last_gui_snapshot_.modal_energies[k]) * 4.0f, 0.0f, 1.0f);
+                    dl->AddRectFilled(ImVec2(p0.x + k * bw + 1.0f, p1.y - ek * (sz.y - 16.0f)),
+                                      ImVec2(p0.x + (k + 1) * bw - 1.0f, p1.y),
+                                      IM_COL32(60, 220, 255, 205), 2.0f);
                 }
-            };
+                const float cx = p0.x + get_param(kParamMaterialMorph) * sz.x;
+                const float cy = p1.y - get_param(kParamPlasmaDrive) * sz.y;
+                dl->AddCircleFilled(ImVec2(cx, cy), 8.0f, IM_COL32(255, 195, 50, 255));
 
-            ImGui::TextColored(ImVec4(0.96f, 0.78f, 0.28f, 1.0f), "1. Материал корпуса и мощь резонатора:");
-            slider_ru(kParamMaterialMorph, "Материал (0=Медь, 0.35=Камень, 0.65=Дерево, 1=Кварц)");
-            slider_ru(kParamPlasmaDrive,   "Накачка плазмы (Насыщенность и обертоны)");
-            slider_ru(kParamModalDecay,    "Длина хвоста / Сустейн резонатора (сек)");
+                float man_b = gui_manual_breath_.load(std::memory_order_relaxed);
+                if (ImGui::SliderFloat("Постоянное дыхание (0 = звук сам затухает)", &man_b, 0.0f, 1.0f)) {
+                    gui_manual_breath_.store(man_b, std::memory_order_relaxed);
+                }
+                bool seq_on = gui_seq_playing_.load(std::memory_order_relaxed);
+                if (ImGui::Button(seq_on ? "Остановить авто-мелодию" : "Включить авто-мелодию")) {
+                    gui_seq_playing_.store(!seq_on, std::memory_order_relaxed);
+                }
+                ImGui::EndChild();
 
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.96f, 0.78f, 0.28f, 1.0f), "2. Фильтр и характер фильтрации:");
-            slider_ru(kParamSvfCutoffHz,   "Яркость фильтра (Частота среза Гц)");
-            slider_ru(kParamSvfResonance,  "Резонанс фильтра (Острота пика)");
-            slider_ru(kParamSvfMorph,      "Тип фильтра (0=Низкие, 0.5=Полоса, 1=Высокие)");
+                ImGui::SameLine();
 
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.96f, 0.78f, 0.28f, 1.0f), "3. Мундштук, воздух и чистый строй:");
-            slider_ru(kParamReedStiffness, "Жесткость трости мундштука");
-            slider_ru(kParamJetTurbulence, "Шум дыхания и турбулентность воздуха");
-            slider_ru(kParamLegatoGlideMs, "Скорость скольжения нот (Глиссандо мс)");
-            slider_ru(kParamFareyGravity,  "Притяжение к чистому строю Фарея");
-            slider_ru(kParamMasterGain,    "Общая громкость выхода");
+                ImGui::BeginChild("NeonRight", ImVec2(0.0f, center_h), true);
+                ImGui::Text("ОСНОВНЫЕ ПАРАМЕТРЫ ТЕМБРА:");
+                ImGui::Separator();
+                auto sl = [&](clap_id pid, const char* lbl) {
+                    float v = get_param(pid);
+                    if (ImGui::SliderFloat(lbl, &v,
+                                           static_cast<float>(param_infos_[pid].min_value),
+                                           static_cast<float>(param_infos_[pid].max_value))) {
+                        push_gui_param_change(pid, v);
+                    }
+                };
+                sl(kParamMaterialMorph, "Материал (Медь-Камень-Дерево-Кварц)");
+                sl(kParamPlasmaDrive,   "Накачка гармоник (Плазма)");
+                sl(kParamModalDecay,    "Время затухания нот (Сустейн, сек)");
+                sl(kParamSvfCutoffHz,   "Яркость фильтра (Гц)");
+                sl(kParamSvfResonance,  "Резонанс фильтра");
+                sl(kParamSvfMorph,      "Тип фильтра (НЧ / Полоса / ВЧ)");
+                sl(kParamReedStiffness, "Жесткость трости");
+                sl(kParamJetTurbulence, "Шум воздуха");
+                sl(kParamLegatoGlideMs, "Скорость глиссандо (мс)");
+                sl(kParamMasterGain,    "Громкость");
+                ImGui::EndChild();
+            }
+            // ----------------------------------------------------------------
+            // ВИД 2 (gui_visual_theme_ == 1): АНАЛОГОВАЯ СТУДИЯ (КРУГЛЫЕ КРУТИЛКИ-РУЧКИ!)
+            // ----------------------------------------------------------------
+            else if (gui_visual_theme_ == 1) {
+                canvas_touch_active_.store(false, std::memory_order_relaxed);
+                ImGui::BeginChild("AnalogStudioConsole", ImVec2(0.0f, center_h), true);
+                ImGui::Text("АНАЛОГОВАЯ СТУДИЙНАЯ КОНСОЛЬ (Тяни круглые ручки мышкой вверх/вниз):");
+                ImGui::Separator();
 
-            bool arp_on = get_param(kParamArpEnable) > 0.5f;
-            if (ImGui::Checkbox("Включить генеративный арпеджиатор (AeroKinetic Arp)", &arp_on)) {
-                push_gui_param_change(kParamArpEnable, arp_on ? 1.0 : 0.0);
+                // Ряд 1: 5 больших круглых ручек резонатора и фильтра
+                draw_rotary_knob("Материал",    kParamMaterialMorph, 38.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Накачка",     kParamPlasmaDrive,   38.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Затухание",   kParamModalDecay,    38.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Фильтр Гц",   kParamSvfCutoffHz,   38.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Резонанс",    kParamSvfResonance,  38.0f);
+
+                ImGui::Spacing();
+                ImGui::Separator();
+
+                // Ряд 2: 5 круглых ручек воздуха, строя и мастера
+                draw_rotary_knob("Тип фильтра", kParamSvfMorph,      36.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Трость",      kParamReedStiffness, 36.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Шум ветра",   kParamJetTurbulence, 36.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Чистый строй",kParamFareyGravity,  36.0f); ImGui::SameLine(0.0f, 28.0f);
+                draw_rotary_knob("Громкость",   kParamMasterGain,    36.0f);
+
+                ImGui::EndChild();
+            }
+            // ----------------------------------------------------------------
+            // ВИД 3 (gui_visual_theme_ == 2): КИБЕР-РАДАР И ЖИВОЙ ОСЦИЛЛОГРАФ ВОЛНЫ
+            // ----------------------------------------------------------------
+            else if (gui_visual_theme_ == 2) {
+                canvas_touch_active_.store(false, std::memory_order_relaxed);
+                ImGui::BeginChild("CyberScopeLeft", ImVec2(w_f * 0.58f, center_h), true);
+                ImGui::Text("ЖИВОЙ ОСЦИЛЛОГРАФ ЗВУКОВОЙ ВОЛНЫ И РАДАР МОД:");
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                const ImVec2 sz = ImGui::GetContentRegionAvail();
+                const ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
+
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(p0, p1, IM_COL32(4, 14, 10, 255), 6.0f);
+
+                // Сетка осциллографа
+                const float mid_y = p0.y + sz.y * 0.5f;
+                dl->AddLine(ImVec2(p0.x, mid_y), ImVec2(p1.x, mid_y), IM_COL32(30, 110, 65, 160), 1.0f);
+
+                // Отрисовка живой волны из кольцевого буфера (128 точек)
+                ImVec2 prev_pt(p0.x, mid_y);
+                for (int i = 0; i < 128; ++i) {
+                    const float x = p0.x + (static_cast<float>(i) / 127.0f) * sz.x;
+                    const float s = clampf(last_gui_snapshot_.scope_wave[i], -1.0f, 1.0f);
+                    const float y = mid_y - s * (sz.y * 0.42f);
+                    const ImVec2 pt(x, y);
+                    if (i > 0) {
+                        dl->AddLine(prev_pt, pt, IM_COL32(55, 255, 155, 245), 2.2f);
+                    }
+                    prev_pt = pt;
+                }
+
+                // Полярный радар справа вверху экрана осциллографа
+                const ImVec2 r_center(p1.x - 85.0f, p0.y + 85.0f);
+                dl->AddCircle(r_center, 65.0f, IM_COL32(45, 220, 130, 180), 36, 1.5f);
+                dl->AddCircle(r_center, 35.0f, IM_COL32(45, 220, 130, 100), 24, 1.0f);
+                for (uint32_t k = 0; k < 16; ++k) {
+                    const float ang = (static_cast<float>(k) / 16.0f) * kTwoPi;
+                    const float r_len = std::min(62.0f, 12.0f + std::sqrt(last_gui_snapshot_.modal_energies[k]) * 180.0f);
+                    dl->AddLine(r_center,
+                                ImVec2(r_center.x + std::cos(ang) * r_len, r_center.y + std::sin(ang) * r_len),
+                                IM_COL32(255, 85, 210, 220), 2.0f);
+                }
+                ImGui::EndChild();
+
+                ImGui::SameLine();
+
+                ImGui::BeginChild("CyberControlsRight", ImVec2(0.0f, center_h), true);
+                ImGui::Text("БЫСТРЫЙ СИНТЕЗ:");
+                draw_rotary_knob("Материал",  kParamMaterialMorph, 30.0f); ImGui::SameLine(0.0f, 18.0f);
+                draw_rotary_knob("Плазма",    kParamPlasmaDrive,   30.0f); ImGui::SameLine(0.0f, 18.0f);
+                draw_rotary_knob("Затухание", kParamModalDecay,    30.0f);
+                draw_rotary_knob("Фильтр Гц", kParamSvfCutoffHz,   30.0f); ImGui::SameLine(0.0f, 18.0f);
+                draw_rotary_knob("Резонанс",  kParamSvfResonance,  30.0f); ImGui::SameLine(0.0f, 18.0f);
+                draw_rotary_knob("Громкость", kParamMasterGain,    30.0f);
+                ImGui::EndChild();
+            }
+            // ----------------------------------------------------------------
+            // ВИД 4 (gui_visual_theme_ == 3): ЧИСТАЯ СЦЕНА / МИНИМАЛИЗМ (4 ОГРОМНЫЕ МАКРО-РУЧКИ)
+            // ----------------------------------------------------------------
+            else {
+                canvas_touch_active_.store(false, std::memory_order_relaxed);
+                ImGui::BeginChild("MinimalStageView", ImVec2(0.0f, center_h), true);
+                ImGui::Text("КОНЦЕРТНЫЙ РЕЖИМ «ЧИСТАЯ СЦЕНА» — ТОЛЬКО 4 ГЛАВНЫЕ РУЧКИ ЗВУКА:");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                draw_rotary_knob("1. МАТЕРИАЛ (Медь..Кварц)", kParamMaterialMorph, 52.0f);
+                ImGui::SameLine(0.0f, 42.0f);
+                draw_rotary_knob("2. ТЕМБР И НАКАЧКА",        kParamPlasmaDrive,   52.0f);
+                ImGui::SameLine(0.0f, 42.0f);
+                draw_rotary_knob("3. ЯРКОСТЬ ФИЛЬТРА",        kParamSvfCutoffHz,   52.0f);
+                ImGui::SameLine(0.0f, 42.0f);
+                draw_rotary_knob("4. ВРЕМЯ ЗАТУХАНИЯ (Сек)",  kParamModalDecay,    52.0f);
+
+                ImGui::EndChild();
             }
         }
-        ImGui::EndChild();
 
         // ====================================================================
-        // 5. НИЖНЯЯ ПАНЕЛЬ: 3-ОКТАВНАЯ ИНТЕРАКТИВНАЯ КЛАВИАТУРА ПИАНИНО
+        // НИЖНЯЯ ПАНЕЛЬ: 3-ОКТАВНАЯ ИНТЕРАКТИВНАЯ КЛАВИАТУРА ПИАНИНО
         // ====================================================================
         render_onscreen_piano_keyboard(0.0f, piano_h);
 
@@ -3195,6 +3389,16 @@ public:
             case WM_MBUTTONDOWN:
                 SetFocus(hwnd);
                 break;
+            case WM_KILLFOCUS:
+            case WM_CAPTURECHANGED:
+                if (self) {
+                    self->canvas_touch_active_.store(false, std::memory_order_relaxed);
+                    if (self->gui_held_mouse_note_ != -1) {
+                        self->push_gui_note_event(static_cast<int16_t>(self->gui_held_mouse_note_), 0.0f, false);
+                        self->gui_held_mouse_note_ = -1;
+                    }
+                }
+                break;
             case WM_SIZE:
                 if (self && wParam != SIZE_MINIMIZED) {
                     const uint32_t nw = static_cast<uint32_t>(LOWORD(lParam));
@@ -3251,7 +3455,7 @@ public:
         gui_hwnd_ = CreateWindowExW(
             0,
             kClassName,
-            L"Tectonic Synth v5.1 — Физический Синтезатор",
+            L"Tectonic Synth v5.2 — Мульти-Интерфейс",
             style,
             0, 0,
             static_cast<int>(gui_width_),
@@ -3589,7 +3793,7 @@ private:
         def(kParamMaterialMorph,   "Resonator", "Материал (Медь-Камень-Дерево-Кварц)", 0.0, 1.0, 0.25);
         def(kParamReedStiffness,   "Exciter",   "Жесткость трости мундштука",  0.1, 1.0, 0.58);
         def(kParamJetTurbulence,   "Exciter",   "Шум воздуха (Турбулентность)",0.0, 1.0, 0.22);
-        def(kParamModalDecay,      "Resonator", "Длина звучания / Сустейн (с)",0.05, 12.0, 2.80);
+        def(kParamModalDecay,      "Resonator", "Длина звучания / Сустейн (с)",0.05, 12.0, 1.20);
         def(kParamPlasmaDrive,     "Resonator", "Накачка плазмы (Обертоны)",   0.0, 1.0, 0.55);
         def(kParamSvfCutoffHz,     "Filter",    "Яркость фильтра (Срез Гц)",   40.0, 18000.0, 4200.0);
         def(kParamSvfResonance,    "Filter",    "Резонанс фильтра",            0.05, 0.98, 0.35);
@@ -3654,6 +3858,8 @@ private:
     std::atomic<bool>     gui_seq_playing_{false};
     std::atomic<float>    gui_manual_breath_{0.0f};
     int                   gui_held_mouse_note_{-1};
+    int                   gui_visual_theme_{0}; // 0=Квантовый Неон, 1=Аналоговая Студия, 2=Кибер-Радар, 3=Минимализм
+    std::array<float, 128> scope_ring_{};
     std::atomic<int32_t>  midi_learn_target_param_{-1};
     std::atomic<bool>     bounce_armed_{false};
     std::atomic<bool>     bounce_recording_{false};
@@ -3960,7 +4166,7 @@ static const clap_plugin_descriptor_t kPluginDescriptor = {
     "https://github.com/tectonic-audio/tectonic-synth-v5",
     "https://github.com/tectonic-audio/tectonic-synth-v5/wiki",
     "https://github.com/tectonic-audio/tectonic-synth-v5/issues",
-    "5.1.0",
+    "5.2.0",
     "Ultra-Performance Physical Waveguide, 64-Mode Spectral Plasma & Farey Lattice CLAP Synthesizer",
     kPluginFeatures
 };
