@@ -1,55 +1,104 @@
-﻿name: Build and Release Tectonic Synth
+name: Build Installers, Deploy Website & Release Tectonic Synth v5
+
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Build and Package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            artifact: TectonicSynth-Windows
-          - os: macos-latest
-            artifact: TectonicSynth-macOS
-          - os: ubuntu-latest
-            artifact: TectonicSynth-Linux
-    runs-on: ${{ matrix.os }}
+          - platform: Windows-x64
+            runner: windows-latest
+            artifact: TectonicSynthV5-Windows-x64
+          - platform: macOS-Universal
+            runner: macos-latest
+            artifact: TectonicSynthV5-macOS-Universal
+          - platform: Linux-x64
+            runner: ubuntu-latest
+            artifact: TectonicSynthV5-Linux-x64
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-      - name: Build Plugin
-        run: cmake --build build --config Release
-      - name: Package Windows plugin and installer
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux OpenGL dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DTECTONIC_ENABLE_IMGUI_OPENGL=ON
+
+      - name: Configure CMake (macOS universal)
+        if: runner.os == 'macOS'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" -DTECTONIC_ENABLE_IMGUI_OPENGL=ON
+
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTECTONIC_ENABLE_IMGUI_OPENGL=ON
+
+      - name: Build plugin
+        run: cmake --build build --config Release --parallel
+
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        run: choco install nsis --yes --no-progress
+
+      - name: Package Windows installer and plugin
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path build/package | Out-Null
-          Copy-Item build/Release/TectonicSynth.clap build/package/TectonicSynth.clap
-          Compress-Archive -Path build/package/TectonicSynth.clap -DestinationPath build/package/TectonicSynth-Windows.zip
-          choco install innosetup -y --no-progress
-          $version = '${{ github.ref_name }}' -replace '^v', ''
-          if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '4.0.1' }
-          $env:APP_VERSION = $version
-          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
-          & $compiler 'installer/TectonicSynth.iss'
+          $ErrorActionPreference = "Stop"
+          $plugin = "build/Release/TectonicSynthV5.clap"
+          if (!(Test-Path $plugin)) { throw "Expected plugin was not built: $plugin" }
+          $staging = "build/staging"
+          New-Item -ItemType Directory -Force -Path $staging, "build/package" | Out-Null
+          Copy-Item $plugin $staging
+          Copy-Item "installer/install_windows.ps1" $staging
+          Compress-Archive -Path "$staging/*" -DestinationPath "build/package/TectonicSynthV5-Windows-x64.zip"
+          cpack --config build/CPackConfig.cmake -B build/package -G NSIS -C Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package macOS plugin
+          if (!(Get-ChildItem "build/package/*.exe")) { throw "NSIS did not produce a Windows installer" }
+
+      - name: Package macOS installer and plugin
         if: runner.os == 'macOS'
         run: |
-          mkdir -p build/package
-          ditto -c -k --keepParent build/TectonicSynth.clap build/package/TectonicSynth-macOS.zip
-      - name: Package Linux plugin
+          set -euo pipefail
+          test -d build/TectonicSynthV5.clap
+          mkdir -p build/staging build/package
+          cp -R build/TectonicSynthV5.clap build/staging/
+          cp installer/install_unix.sh build/staging/
+          chmod +x build/staging/install_unix.sh
+          (cd build/staging && zip -r ../package/TectonicSynthV5-macOS-Universal.zip .)
+          cpack --config build/CPackConfig.cmake -B build/package -G productbuild -C Release
+          compgen -G "build/package/*.pkg" > /dev/null
+
+      - name: Package Linux installer and plugin
         if: runner.os == 'Linux'
         run: |
-          mkdir -p build/package
-          tar -czf build/package/TectonicSynth-Linux.tar.gz -C build TectonicSynth.clap
+          set -euo pipefail
+          test -f build/TectonicSynthV5.clap
+          mkdir -p build/staging build/package
+          cp build/TectonicSynthV5.clap installer/install_unix.sh build/staging/
+          chmod +x build/staging/install_unix.sh
+          (cd build/staging && zip -r ../package/TectonicSynthV5-Linux-x64.zip .)
+          cpack --config build/CPackConfig.cmake -B build/package -G DEB -C Release
+          compgen -G "build/package/*.deb" > /dev/null
+
       - name: Upload packaged downloads
         uses: actions/upload-artifact@v4
         with:
@@ -57,19 +106,46 @@ jobs:
           path: build/package/*
           if-no-files-found: error
 
+  deploy-pages:
+    name: Deploy website to GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
   release:
+    name: Publish GitHub Release and installers
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Download all platform packages
+      - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: TectonicSynth-*
-          path: release-files
+          pattern: TectonicSynthV5-*
+          path: release_assets
           merge-multiple: true
       - name: Publish GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release-files/* --title "Tectonic Synth $GITHUB_REF_NAME" --generate-notes
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          generate_release_notes: true

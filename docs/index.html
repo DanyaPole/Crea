@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tectonic Synth v5 — Quantum Observatory CLAP Synthesizer</title>
+  <style>
+    :root {
+      --bg: #0a0e17;
+      --card: #121a2a;
+      --accent: #47e0f5;
+      --gold: #ebb038;
+      --text: #e6edf7;
+      --muted: #93a4be;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at 50% 15%, #16243b 0%, var(--bg) 70%);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 3rem 1.5rem;
+    }
+    .container { max-width: 980px; margin: 0 auto; }
+    header { text-align: center; margin-bottom: 3rem; }
+    .badge {
+      display: inline-block;
+      background: rgba(71, 224, 245, 0.12);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      padding: 0.25rem 0.85rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      margin-bottom: 1rem;
+    }
+    h1 { font-size: 2.6rem; letter-spacing: -0.02em; margin-bottom: 0.75rem; }
+    p.lead { color: var(--muted); font-size: 1.15rem; max-width: 720px; margin: 0 auto 2rem; }
+    .downloads {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 3rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 1.5rem;
+      text-align: center;
+    }
+    .card h3 { color: var(--gold); margin-bottom: 0.5rem; }
+    .card p { color: var(--muted); font-size: 0.92rem; margin-bottom: 1.2rem; }
+    .btn {
+      display: inline-block;
+      background: var(--accent);
+      color: #061019;
+      font-weight: 700;
+      text-decoration: none;
+      padding: 0.65rem 1.25rem;
+      border-radius: 8px;
+    }
+    .specs {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 2rem;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .specs h2 { margin-bottom: 1rem; color: var(--accent); }
+    .specs ul { padding-left: 1.25rem; color: var(--muted); }
+    .specs li { margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="badge">C++20 • CLAP 1.2 • Zero-Allocation DSP • 60 FPS OpenGL 3.3</span>
+      <h1>Tectonic Synth v5</h1>
+      <p class="lead">
+        Ультра-производительный физический синтезатор с двунаправленным волноводом Тирана,
+        64-модовым спектрально-плазменным резонатором, адаптивным строем Фарея и авто-адаптацией
+        под Roland Aerophone AE-30, Arturia MicroLab и микрофон.
+      </p>
+    </header>
+
+    <section class="downloads">
+      <div class="card">
+        <h3>Windows (x64 AVX2)</h3>
+        <p>Готовый установщик NSIS (<code>.exe</code>) и архив <code>TectonicSynthV5.clap</code> для Bitwig Studio</p>
+        <a class="btn" href="https://github.com/DanyaPole/Crea/releases/latest">Скачать для Windows</a>
+      </div>
+      <div class="card">
+        <h3>macOS (Universal Binary)</h3>
+        <p>Нативный пакет <code>.pkg</code> и бандл <code>TectonicSynthV5.clap</code> (Apple Silicon M1/M2/M3/M4 + Intel)</p>
+        <a class="btn" href="https://github.com/DanyaPole/Crea/releases/latest">Скачать для macOS</a>
+      </div>
+      <div class="card">
+        <h3>Linux (x64 GCC / DEB)</h3>
+        <p>Пакет <code>.deb</code> и бинарный модуль <code>TectonicSynthV5.clap</code> (X11 + OpenGL 3.3)</p>
+        <a class="btn" href="https://github.com/DanyaPole/Crea/releases/latest">Скачать для Linux</a>
+      </div>
+    </section>
+
+    <section class="specs">
+      <h2>Ключевые возможности релиза v5.0.0</h2>
+      <ul>
+        <li><strong>RT-Safety & Zero-Allocation Law:</strong> 100% преаллокация с выравниванием <code>alignas(64)</code>, защита от денормалов <code>MXCSR / FPCR</code>, <code>WaitFreeTripleBuffer</code> и <code>Triple-Slot RCU</code>.</li>
+        <li><strong>Smart Workflow Auto-Sense:</strong> мгновенная адаптация под Roland Aerophone AE-30 (Dual-Stream Breath Arbiter, Bite Center-Notch, True Physical Legato), Arturia MicroLab (Virtual Lung ADSR, Mod Strip Macro, Plasma Freeze), микрофон (I/Q Hilbert Exciter) и автономный режим DAW.</li>
+        <li><strong>Пять физических и генеративных движков:</strong> WDF-возбудитель Паде, волновод Тирана 3-го порядка, 64-модовый резонатор с симплектическим лимитером ISO 226, морфирующий фильтр Завалишина TPT SVF и арпеджиатор Энона/Тоннетц со шкалой Фарея 3..13.</li>
+      </ul>
+    </section>
+  </div>
+</body>
+</html>
