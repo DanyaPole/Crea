@@ -106,6 +106,7 @@ endif()
 if(APPLE)
     install(TARGETS TectonicSynthV5
         BUNDLE DESTINATION "."
+        LIBRARY DESTINATION "."
         COMPONENT Plugin
     )
 else()
