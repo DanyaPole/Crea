@@ -18,7 +18,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(clap)
 
-# 2. Optionally fetch Dear ImGui + OpenGL3 for the 60 FPS Quantum Observatory GUI
+# 2. Fetch Dear ImGui + OpenGL3 (+ Win32 backend on Windows) for the 60 FPS Quantum Observatory GUI
 if(TECTONIC_ENABLE_IMGUI_OPENGL)
     FetchContent_Declare(
         imgui
@@ -44,6 +44,11 @@ if(TECTONIC_ENABLE_IMGUI_OPENGL)
         ${imgui_SOURCE_DIR}/imgui_widgets.cpp
         ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     )
+    if(WIN32)
+        target_sources(TectonicSynthV5 PRIVATE
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+        )
+    endif()
     target_include_directories(TectonicSynthV5 PRIVATE
         ${imgui_SOURCE_DIR}
         ${imgui_SOURCE_DIR}/backends
@@ -55,7 +60,7 @@ endif()
 # 4. Architecture-specific SIMD flags (AVX2 + FMA on x86_64, NEON on ARM64)
 if(MSVC)
     target_compile_options(TectonicSynthV5 PRIVATE
-        /W4 /O2 /Oi /Ot /fp:fast /permissive-
+        /W4 /O2 /Oi /Ot /fp:fast /permissive- /utf-8
     )
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
         target_compile_options(TectonicSynthV5 PRIVATE /arch:AVX2)
@@ -91,7 +96,7 @@ elseif(WIN32)
         OUTPUT_NAME "TectonicSynthV5"
         SUFFIX ".clap"
     )
-    target_link_libraries(TectonicSynthV5 PRIVATE opengl32 gdi32 user32 shell32 ole32 comctl32)
+    target_link_libraries(TectonicSynthV5 PRIVATE opengl32 gdi32 user32 shell32 ole32 dwmapi)
 else()
     # Linux X11 + OpenGL + pthread
     find_package(Threads REQUIRED)
@@ -102,6 +107,7 @@ else()
     )
     target_link_libraries(TectonicSynthV5 PRIVATE Threads::Threads dl)
 endif()
+
 # 6. Install rules & CPack Cross-Platform Installer Configuration
 if(APPLE)
     install(TARGETS TectonicSynthV5
@@ -119,7 +125,7 @@ endif()
 
 set(CPACK_PACKAGE_NAME "TectonicSynthV5")
 set(CPACK_PACKAGE_VENDOR "Tectonic Audio Research Lab")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Tectonic Synth v5 — Quantum Observatory CLAP Synthesizer")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Tectonic Synth v5.0.3 — Quantum Observatory CLAP Synthesizer")
 set(CPACK_PACKAGE_VERSION_MAJOR 5)
 set(CPACK_PACKAGE_VERSION_MINOR 0)
 set(CPACK_PACKAGE_VERSION_PATCH 3)

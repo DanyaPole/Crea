@@ -28,6 +28,10 @@ typedef struct clap_version {
 
 #define CLAP_VERSION_INIT { 1, 2, 0 }
 
+static inline bool clap_version_is_compatible(const clap_version_t v) {
+    return v.major >= 1;
+}
+
 typedef struct clap_host {
     clap_version_t clap_version;
     void *host_data;
@@ -73,8 +77,22 @@ enum {
     CLAP_EVENT_NOTE_EXPRESSION = 4,
     CLAP_EVENT_PARAM_VALUE = 5,
     CLAP_EVENT_PARAM_MOD = 6,
-    CLAP_EVENT_MIDI = 10
+    CLAP_EVENT_PARAM_GESTURE_BEGIN = 7,
+    CLAP_EVENT_PARAM_GESTURE_END = 8,
+    CLAP_EVENT_TRANSPORT = 9,
+    CLAP_EVENT_MIDI = 10,
+    CLAP_EVENT_MIDI_SYSEX = 11,
+    CLAP_EVENT_MIDI2 = 12
 };
+
+enum clap_transport_flags {
+    CLAP_TRANSPORT_HAS_TEMPO = 1 << 0,
+    CLAP_TRANSPORT_HAS_BEATS_TIMELINE = 1 << 1,
+    CLAP_TRANSPORT_IS_PLAYING = 1 << 4
+};
+
+typedef int64_t clap_beattime;
+static const int64_t CLAP_BEATTIME_FACTOR = 1LL << 31;
 
 typedef struct clap_event_header {
     uint32_t size;
@@ -142,6 +160,18 @@ typedef struct clap_event_midi {
     uint8_t data[3];
 } clap_event_midi_t;
 
+typedef struct clap_event_transport {
+    clap_event_header_t header;
+    uint32_t flags;
+    clap_beattime song_pos_beats;
+    double tempo;
+    double tempo_inc;
+    clap_beattime bar_start;
+    int32_t bar_number;
+    uint16_t tsig_num;
+    uint16_t tsig_denom;
+} clap_event_transport_t;
+
 typedef struct clap_input_events {
     void *ctx;
     uint32_t (CLAP_ABI *size)(const struct clap_input_events *list);
@@ -164,7 +194,7 @@ typedef struct clap_audio_buffer {
 typedef struct clap_process {
     int64_t steady_time;
     uint32_t frames_count;
-    const void *transport;
+    const clap_event_transport_t *transport;
     const clap_audio_buffer_t *audio_inputs;
     clap_audio_buffer_t *audio_outputs;
     uint32_t audio_inputs_count;
@@ -272,17 +302,6 @@ typedef struct clap_plugin_note_ports {
     bool (CLAP_ABI *get)(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_note_port_info_t *info);
 } clap_plugin_note_ports_t;
 
-#define CLAP_EXT_VOICE_INFO "clap.voice-info"
-enum { CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES = 1 << 0 };
-typedef struct clap_voice_info {
-    uint32_t voice_count;
-    uint32_t voice_capacity;
-    uint64_t flags;
-} clap_voice_info_t;
-typedef struct clap_plugin_voice_info {
-    bool (CLAP_ABI *get)(const clap_plugin_t *plugin, clap_voice_info_t *info);
-} clap_plugin_voice_info_t;
-
 #define CLAP_EXT_STATE "clap.state"
 typedef struct clap_istream {
     void *ctx;
@@ -311,34 +330,55 @@ typedef struct clap_plugin_entry {
     const void *(CLAP_ABI *get_factory)(const char *factory_id);
 } clap_plugin_entry_t;
 
+// Official CLAP 1.2 Window API Identifiers (MUST be "win32", "cocoa", "x11")
 #define CLAP_WINDOW_API_WIN32 "win32"
-#define CLAP_WINDOW_API_NS_VIEW "clap.window.ns-view"
-#define CLAP_WINDOW_API_X11 "clap.window.x11"
-#define CLAP_EXT_GUI "clap.gui"
+#define CLAP_WINDOW_API_COCOA "cocoa"
+#define CLAP_WINDOW_API_X11   "x11"
+#define CLAP_EXT_GUI          "clap.gui"
 
 typedef struct clap_window {
-   void *win32;
-   void *ns_view;
-   struct {
-      void *display;
-      unsigned long window;
-   } x11;
+    const char *api;
+    union {
+        void *cocoa;
+        unsigned long x11;
+        void *win32;
+        void *ptr;
+    };
 } clap_window_t;
 
+typedef struct clap_gui_resize_hints {
+    bool can_resize_horizontally;
+    bool can_resize_vertically;
+    bool preserve_aspect_ratio;
+    uint32_t aspect_ratio_width;
+    uint32_t aspect_ratio_height;
+} clap_gui_resize_hints_t;
+
+typedef struct clap_host_gui {
+    void (CLAP_ABI *resize_hints_changed)(const clap_host_t *host);
+    bool (CLAP_ABI *request_resize)(const clap_host_t *host, uint32_t width, uint32_t height);
+    bool (CLAP_ABI *request_show)(const clap_host_t *host);
+    bool (CLAP_ABI *request_hide)(const clap_host_t *host);
+    void (CLAP_ABI *closed)(const clap_host_t *host, bool was_destroyed);
+} clap_host_gui_t;
+
+// Official CLAP 1.2 15-member clap_plugin_gui_t vtable
 typedef struct clap_plugin_gui {
-   bool (CLAP_ABI *is_api_supported)(const clap_plugin_t *plugin, const char *api, bool is_floating);
-   bool (CLAP_ABI *get_preferred_api)(const clap_plugin_t *plugin, const char **api, bool *is_floating);
-   bool (CLAP_ABI *create)(const clap_plugin_t *plugin, const char *api, bool is_floating);
-   void (CLAP_ABI *destroy)(const clap_plugin_t *plugin);
-   bool (CLAP_ABI *set_scale)(const clap_plugin_t *plugin, double scale);
-   bool (CLAP_ABI *get_size)(const clap_plugin_t *plugin, uint32_t *width, uint32_t *height);
-   bool (CLAP_ABI *can_resize)(const clap_plugin_t *plugin);
-   bool (CLAP_ABI *set_size)(const clap_plugin_t *plugin, uint32_t width, uint32_t height);
-   bool (CLAP_ABI *set_parent)(const clap_plugin_t *plugin, const clap_window_t *window);
-   bool (CLAP_ABI *set_transient)(const clap_plugin_t *plugin, const clap_window_t *window);
-   void (CLAP_ABI *suggest_title)(const clap_plugin_t *plugin, const char *title);
-   bool (CLAP_ABI *show)(const clap_plugin_t *plugin);
-   bool (CLAP_ABI *hide)(const clap_plugin_t *plugin);
+    bool (CLAP_ABI *is_api_supported)(const clap_plugin_t *plugin, const char *api, bool is_floating);
+    bool (CLAP_ABI *get_preferred_api)(const clap_plugin_t *plugin, const char **api, bool *is_floating);
+    bool (CLAP_ABI *create)(const clap_plugin_t *plugin, const char *api, bool is_floating);
+    void (CLAP_ABI *destroy)(const clap_plugin_t *plugin);
+    bool (CLAP_ABI *set_scale)(const clap_plugin_t *plugin, double scale);
+    bool (CLAP_ABI *get_size)(const clap_plugin_t *plugin, uint32_t *width, uint32_t *height);
+    bool (CLAP_ABI *can_resize)(const clap_plugin_t *plugin);
+    bool (CLAP_ABI *get_resize_hints)(const clap_plugin_t *plugin, clap_gui_resize_hints_t *hints);
+    bool (CLAP_ABI *adjust_size)(const clap_plugin_t *plugin, uint32_t *width, uint32_t *height);
+    bool (CLAP_ABI *set_size)(const clap_plugin_t *plugin, uint32_t width, uint32_t height);
+    bool (CLAP_ABI *set_parent)(const clap_plugin_t *plugin, const clap_window_t *window);
+    bool (CLAP_ABI *set_transient)(const clap_plugin_t *plugin, const clap_window_t *window);
+    void (CLAP_ABI *suggest_title)(const clap_plugin_t *plugin, const char *title);
+    bool (CLAP_ABI *show)(const clap_plugin_t *plugin);
+    bool (CLAP_ABI *hide)(const clap_plugin_t *plugin);
 } clap_plugin_gui_t;
 
 #ifdef __cplusplus

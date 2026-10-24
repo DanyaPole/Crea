@@ -39,14 +39,6 @@
 #include <thread>
 #include <vector>
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <commctrl.h>
-#endif
-
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #define TECTONIC_ARCH_X64 1
@@ -436,9 +428,26 @@ struct clap_plugin_entry_t {
 } // extern "C"
 #endif
 
-// Optional Dear ImGui & OpenGL headers when compiled with GUI enabled
+// Win32 Native Windowing, WGL OpenGL & Dear ImGui Backend Headers
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <GL/gl.h>
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+#endif
+
 #if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
 #include <imgui.h>
+#include <backends/imgui_impl_opengl3.h>
+#if defined(_WIN32) && __has_include(<backends/imgui_impl_win32.h>)
+#include <backends/imgui_impl_win32.h>
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#endif
 #endif
 
 namespace tectonic {
@@ -1696,10 +1705,32 @@ void main() {
 }
 )GLSL";
 
-// RAII OpenGL State Guard so host DAW (Bitwig / Reaper) GL state is never corrupted
+// RAII OpenGL Context Guard so host DAW (Bitwig / Reaper) GL context is never corrupted
 struct ScopedGlStateGuard {
+#if defined(_WIN32)
+    HDC   prev_dc_{nullptr};
+    HGLRC prev_rc_{nullptr};
+    bool  switched_{false};
+
+    explicit ScopedGlStateGuard(HDC target_dc = nullptr, HGLRC target_rc = nullptr) noexcept {
+        if (target_dc && target_rc) {
+            prev_dc_ = wglGetCurrentDC();
+            prev_rc_ = wglGetCurrentContext();
+            if (prev_dc_ != target_dc || prev_rc_ != target_rc) {
+                wglMakeCurrent(target_dc, target_rc);
+                switched_ = true;
+            }
+        }
+    }
+    ~ScopedGlStateGuard() noexcept {
+        if (switched_) {
+            wglMakeCurrent(prev_dc_, prev_rc_);
+        }
+    }
+#else
     ScopedGlStateGuard() noexcept = default;
     ~ScopedGlStateGuard() noexcept = default;
+#endif
 };
 
 // ============================================================================
@@ -1719,9 +1750,7 @@ public:
     }
 
     ~TectonicSynthPlugin() {
-#if defined(_WIN32)
-        destroy_windows_gui();
-#endif
+        gui_destroy();
         stop_disk_writer_thread();
     }
 
@@ -2428,105 +2457,688 @@ public:
     }
 
 // ============================================================================
-// SECTION VII-B: DEAR IMGUI + OPENGL 3.3 CORE 60 FPS RENDERER IMPLEMENTATION
+// SECTION VII-B: DEAR IMGUI + WIN32 WGL OPENGL 60 FPS QUANTUM OBSERVATORY GUI
 // ============================================================================
-// Renders the 4 homotopic modes of the Quantum Observatory:
-//   - Mode 0 (kPianoRoll): Chrono-Logarithmic MPE Grid + Farey Gravity Valleys
-//   - Mode 1 (kMidiController): Bipartite Bezier Graph + Atomic MIDI Learn
-//   - Mode 2 (kLiveTakeBounce): Holographic Tape + [DRAG WAV TO DAW TRACK]
-//   - Mode 3 (kAerophoneHub): Polar Astrolabe + 5 Quick Hardware Presets +
-//                             AUTO-ZERO CALIBRATE + Anti-Zipper Telemetry
+// Full integration of the 4 homotopic modes of the Quantum Observatory with
+// native Win32 child/floating HWND, WGL OpenGL context, per-plugin ImGuiContext,
+// 60 FPS WM_TIMER loop, and custom ImDrawList vector visualizations.
+
+    void apply_quantum_observatory_theme() noexcept {
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding    = 0.0f;
+        style.ChildRounding     = 6.0f;
+        style.FrameRounding     = 4.0f;
+        style.GrabRounding      = 4.0f;
+        style.PopupRounding     = 4.0f;
+        style.ScrollbarRounding = 4.0f;
+        style.WindowBorderSize  = 0.0f;
+        style.FrameBorderSize   = 1.0f;
+        style.ItemSpacing       = ImVec2(8.0f, 6.0f);
+        style.WindowPadding     = ImVec2(14.0f, 12.0f);
+
+        ImVec4* colors = style.Colors;
+        colors[ImGuiCol_WindowBg]         = ImVec4(0.04f, 0.06f, 0.10f, 1.00f);
+        colors[ImGuiCol_ChildBg]          = ImVec4(0.07f, 0.10f, 0.16f, 0.92f);
+        colors[ImGuiCol_Border]           = ImVec4(0.18f, 0.38f, 0.52f, 0.55f);
+        colors[ImGuiCol_FrameBg]          = ImVec4(0.09f, 0.14f, 0.22f, 1.00f);
+        colors[ImGuiCol_FrameBgHovered]   = ImVec4(0.14f, 0.24f, 0.36f, 1.00f);
+        colors[ImGuiCol_FrameBgActive]    = ImVec4(0.18f, 0.34f, 0.48f, 1.00f);
+        colors[ImGuiCol_TitleBg]          = ImVec4(0.05f, 0.08f, 0.14f, 1.00f);
+        colors[ImGuiCol_TitleBgActive]    = ImVec4(0.08f, 0.14f, 0.24f, 1.00f);
+        colors[ImGuiCol_Button]           = ImVec4(0.11f, 0.22f, 0.34f, 1.00f);
+        colors[ImGuiCol_ButtonHovered]    = ImVec4(0.18f, 0.42f, 0.62f, 1.00f);
+        colors[ImGuiCol_ButtonActive]     = ImVec4(0.24f, 0.62f, 0.84f, 1.00f);
+        colors[ImGuiCol_Header]           = ImVec4(0.14f, 0.28f, 0.42f, 1.00f);
+        colors[ImGuiCol_HeaderHovered]    = ImVec4(0.20f, 0.42f, 0.60f, 1.00f);
+        colors[ImGuiCol_HeaderActive]     = ImVec4(0.26f, 0.56f, 0.78f, 1.00f);
+        colors[ImGuiCol_SliderGrab]       = ImVec4(0.28f, 0.85f, 0.96f, 1.00f);
+        colors[ImGuiCol_SliderGrabActive] = ImVec4(0.95f, 0.72f, 0.24f, 1.00f);
+        colors[ImGuiCol_CheckMark]        = ImVec4(0.28f, 0.88f, 0.96f, 1.00f);
+        colors[ImGuiCol_Text]             = ImVec4(0.90f, 0.95f, 0.99f, 1.00f);
+#endif
+    }
+
     void render_quantum_observatory_imgui() noexcept {
-        ScopedGlStateGuard gl_guard{};
         step_gui_frame_60fps(1.0f / 60.0f);
 
 #if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(gui_width_), static_cast<float>(gui_height_)));
-        ImGui::Begin("Tectonic Synth v5 — Quantum Observatory (60 FPS)", nullptr,
-                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        const float w_f = static_cast<float>(gui_width_);
+        const float h_f = static_cast<float>(gui_height_);
 
-        // Top Navigation Bar: 4 Homotopic Modes
-        if (ImGui::Button("1. MPE Piano Roll"))     push_gui_param_change(kParamUiMode, 0.0);
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(w_f, h_f));
+        ImGui::Begin("Tectonic Synth v5.0.3 — Quantum Observatory (60 FPS)", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        // ====================================================================
+        // HEADER BAR: Title, Active Profile Badge, Peak Meters & 4 Mode Tabs
+        // ====================================================================
+        ImGui::TextColored(ImVec4(0.28f, 0.88f, 0.96f, 1.0f),
+                           "TECTONIC SYNTH v5.0.3 — QUANTUM OBSERVATORY");
+        ImGui::SameLine(w_f - 390.0f);
+        ImGui::TextColored(ImVec4(0.92f, 0.70f, 0.22f, 1.0f),
+                           "L: %.2f | R: %.2f | %s | N_eff: %.1f",
+                           last_gui_snapshot_.master_peak_l,
+                           last_gui_snapshot_.master_peak_r,
+                           last_gui_snapshot_.plasma_freeze_active ? "FREEZE ON" : "LIVE",
+                           last_gui_snapshot_.effective_farey_order);
+
+        const int cur_mode = std::clamp(static_cast<int>(std::lround(get_param(kParamUiMode))), 0, 3);
+        auto mode_tab = [&](const char* label, int idx) {
+            const bool active = (cur_mode == idx);
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.54f, 0.76f, 1.0f));
+            }
+            if (ImGui::Button(label, ImVec2((w_f - 56.0f) * 0.25f, 30.0f))) {
+                push_gui_param_change(kParamUiMode, static_cast<double>(idx));
+            }
+            if (active) {
+                ImGui::PopStyleColor();
+            }
+        };
+
+        mode_tab("1. MPE PIANO ROLL & FAREY GRID", 0);
         ImGui::SameLine();
-        if (ImGui::Button("2. MIDI Matrix & Learn")) push_gui_param_change(kParamUiMode, 1.0);
+        mode_tab("2. MIDI MATRIX & ATOMIC LEARN", 1);
         ImGui::SameLine();
-        if (ImGui::Button("3. Live Take & Bounce"))  push_gui_param_change(kParamUiMode, 2.0);
+        mode_tab("3. LIVE TAKE & AUDIO BOUNCE", 2);
         ImGui::SameLine();
-        if (ImGui::Button("4. Aerophone / Mic Hub")) push_gui_param_change(kParamUiMode, 3.0);
+        mode_tab("4. AEROPHONE / MICROLAB / MIC HUB", 3);
 
         ImGui::Separator();
 
-        // Mode 4: Universal Aerophone, MicroLab & Mic Hub
-        if (mode_weights_[3] > 0.1f) {
-            ImGui::Text("QUICK HARDWARE WORKFLOW PRESETS:");
-            if (ImGui::Button("[1. Roland AE-30 Native]"))   apply_quick_hardware_preset(HardwareProfile::kRolandAE30);
-            ImGui::SameLine();
-            if (ImGui::Button("[2. Arturia MicroLab / Keys]")) apply_quick_hardware_preset(HardwareProfile::kArturiaMicroLab);
-            ImGui::SameLine();
-            if (ImGui::Button("[3. Akai EWI / NuRAD]"))      apply_quick_hardware_preset(HardwareProfile::kAkaiEwiNuRAD);
-            ImGui::SameLine();
-            if (ImGui::Button("[4. Live Mic Exciter]"))      apply_quick_hardware_preset(HardwareProfile::kLiveMicExciter);
-            ImGui::SameLine();
-            if (ImGui::Button("[5. In-The-Box DAW Auto]"))   apply_quick_hardware_preset(HardwareProfile::kInTheBoxDaw);
+        // ====================================================================
+        // TOP INTERACTIVE VISUALIZER: 64-MODE SPECTRAL PLASMA & ISO-226 TRENCH
+        // ====================================================================
+        ImGui::BeginChild("SpectralPlasmaVisualizer", ImVec2(0.0f, 175.0f), true);
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const ImVec2 sz = ImGui::GetContentRegionAvail();
+            const ImVec2 p1 = ImVec2(p0.x + sz.x, p0.y + sz.y);
 
-            if (ImGui::Button("AUTO-ZERO CALIBRATE (Breath Deadzone)")) {
-                auto_zero_calibrate_requested_.store(true, std::memory_order_release);
+            // Background gradient & interactive XY Plasma Touch Pad
+            dl->AddRectFilledMultiColor(
+                p0, p1,
+                IM_COL32(10, 16, 28, 255), IM_COL32(16, 28, 46, 255),
+                IM_COL32(12, 22, 36, 255), IM_COL32(8, 12, 20, 255));
+
+            ImGui::InvisibleButton("PlasmaCanvasTouch", sz);
+            const bool canvas_hovered = ImGui::IsItemHovered();
+            const bool canvas_active  = ImGui::IsItemActive();
+            canvas_touch_active_.store(canvas_active, std::memory_order_relaxed);
+
+            if (canvas_active && sz.x > 1.0f && sz.y > 1.0f) {
+                const ImVec2 mp = ImGui::GetIO().MousePos;
+                const float norm_x = clampf((mp.x - p0.x) / sz.x, 0.0f, 1.0f);
+                const float norm_y = clampf(1.0f - (mp.y - p0.y) / sz.y, 0.0f, 1.0f);
+                push_gui_param_change(kParamMaterialMorph, norm_x);
+                push_gui_param_change(kParamPlasmaDrive, norm_y);
             }
-            ImGui::Text("Mouth Pressure: %.3f | Bite Offset: %+.3f | Farey Order N_eff: %.2f | Tongue Hit: %s",
-                        last_gui_snapshot_.mouth_pressure,
-                        last_gui_snapshot_.bite_offset,
-                        last_gui_snapshot_.effective_farey_order,
-                        last_gui_snapshot_.tongue_attack_detected ? "STRIKE" : "idle");
+
+            // Draw 64 Tectonic Modal Bars + ISO 226 Threshold Curve
+            const float bar_w = sz.x / static_cast<float>(kNumModes);
+            ImVec2 prev_thresh_pt{};
+            for (uint32_t k = 0; k < kNumModes; ++k) {
+                const float ek     = clampf(std::sqrt(last_gui_snapshot_.modal_energies[k]) * 3.5f, 0.0f, 1.0f);
+                const float th     = clampf(std::sqrt(last_gui_snapshot_.modal_thresholds[k]) * 1.4f, 0.0f, 1.0f);
+                const float x_left = p0.x + static_cast<float>(k) * bar_w;
+                const float y_top  = p1.y - ek * (sz.y - 24.0f);
+
+                const ImU32 bar_col = (ek > th)
+                    ? IM_COL32(255, 175, 55, 235)
+                    : IM_COL32(65, 215, 245, 210);
+                dl->AddRectFilled(
+                    ImVec2(x_left + 1.0f, y_top),
+                    ImVec2(x_left + bar_w - 1.0f, p1.y),
+                    bar_col, 2.0f);
+
+                const ImVec2 th_pt(x_left + bar_w * 0.5f, p1.y - th * (sz.y - 24.0f));
+                if (k > 0) {
+                    dl->AddLine(prev_thresh_pt, th_pt, IM_COL32(245, 90, 90, 200), 1.8f);
+                }
+                prev_thresh_pt = th_pt;
+            }
+
+            // Overlay telemetry text inside the visualizer
+            char overlay_buf[256];
+            std::snprintf(overlay_buf, sizeof(overlay_buf),
+                          "64-MODE SPECTRAL PLASMA ANALYZER (Drag X: Material Morph %.2f | Drag Y: Plasma Drive %.2f)%s",
+                          get_param(kParamMaterialMorph),
+                          get_param(kParamPlasmaDrive),
+                          canvas_hovered ? " [CLICK & DRAG TO EXCITE PLASMA]" : "");
+            dl->AddText(ImVec2(p0.x + 8.0f, p0.y + 6.0f), IM_COL32(220, 240, 255, 235), overlay_buf);
         }
+        ImGui::EndChild();
 
-        // Mode 3: Live Take & Audio Bounce
-        if (mode_weights_[2] > 0.1f) {
-            bool armed = bounce_armed_.load(std::memory_order_relaxed);
-            if (ImGui::Checkbox("Auto-Start Recording on Breath / Signal Threshold", &armed)) {
-                bounce_armed_.store(armed, std::memory_order_release);
+        // ====================================================================
+        // MAIN MODE WORKSPACE (LEFT 62%) + GLOBAL DSP RACK (RIGHT 38%)
+        // ====================================================================
+        const float avail_h = ImGui::GetContentRegionAvail().y;
+        ImGui::BeginChild("LeftModeWorkspace", ImVec2(w_f * 0.60f, avail_h), true);
+        {
+            // ----------------------------------------------------------------
+            // MODE 4 (index 3): Universal Aerophone, MicroLab & Live Mic Hub
+            // ----------------------------------------------------------------
+            if (cur_mode == 3) {
+                ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.25f, 1.0f),
+                                   "SMART WORKFLOW AUTO-SENSE & HARDWARE PRESETS");
+                if (ImGui::Button("[1. Roland AE-30 Native]"))     apply_quick_hardware_preset(HardwareProfile::kRolandAE30);
+                ImGui::SameLine();
+                if (ImGui::Button("[2. Arturia MicroLab / Keys]")) apply_quick_hardware_preset(HardwareProfile::kArturiaMicroLab);
+                ImGui::SameLine();
+                if (ImGui::Button("[3. Akai EWI / NuRAD]"))        apply_quick_hardware_preset(HardwareProfile::kAkaiEwiNuRAD);
+
+                if (ImGui::Button("[4. Live Mic Exciter]"))        apply_quick_hardware_preset(HardwareProfile::kLiveMicExciter);
+                ImGui::SameLine();
+                if (ImGui::Button("[5. In-The-Box DAW Auto]"))     apply_quick_hardware_preset(HardwareProfile::kInTheBoxDaw);
+                ImGui::SameLine();
+                if (ImGui::Button("AUTO-ZERO CALIBRATE (Breath Deadzone)")) {
+                    auto_zero_calibrate_requested_.store(true, std::memory_order_release);
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Mouth Pressure: %.3f | Bite Offset: %+.3f | Gyro Tilt: %.2f | Tongue Hit: %s",
+                            last_gui_snapshot_.mouth_pressure,
+                            last_gui_snapshot_.bite_offset,
+                            last_gui_snapshot_.tilt_norm,
+                            last_gui_snapshot_.tongue_attack_detected ? "STRIKE!" : "Idle");
+                ImGui::Text("Mic Hilbert Envelope: %.3f | Tracked Mic Pitch: %.1f Hz",
+                            last_gui_snapshot_.mic_envelope,
+                            last_gui_snapshot_.mic_pitch_hz);
+
+                // Polar Astrolabe & Reed Aperture Vector Widget
+                ImVec2 astro_pos = ImGui::GetCursorScreenPos();
+                ImVec2 astro_sz  = ImGui::GetContentRegionAvail();
+                if (astro_sz.y > 90.0f) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 center(astro_pos.x + astro_sz.x * 0.5f, astro_pos.y + astro_sz.y * 0.5f);
+                    const float radius = std::min(astro_sz.x, astro_sz.y) * 0.42f;
+                    dl->AddCircleFilled(center, radius, IM_COL32(12, 22, 36, 255), 48);
+                    dl->AddCircle(center, radius, IM_COL32(70, 210, 245, 180), 48, 2.0f);
+                    dl->AddCircle(center, radius * 0.65f, IM_COL32(70, 210, 245, 90), 36, 1.0f);
+                    dl->AddCircle(center, radius * std::max(0.08f, last_gui_snapshot_.mouth_pressure),
+                                  IM_COL32(245, 180, 55, 220), 36, 3.0f);
+
+                    const float angle = last_gui_snapshot_.bite_offset * 3.14159f;
+                    const ImVec2 tip(center.x + std::sin(angle) * radius * 0.9f,
+                                     center.y - std::cos(angle) * radius * 0.9f);
+                    dl->AddLine(center, tip, IM_COL32(80, 245, 190, 255), 2.5f);
+                }
             }
-            if (ImGui::Button("[FINALIZE & SAVE 32-BIT FLOAT WAV]")) {
-                trigger_save_live_take_wav("");
+            // ----------------------------------------------------------------
+            // MODE 1 (index 0): Interactive MPE Piano Roll & Pattern Arena RCU
+            // ----------------------------------------------------------------
+            else if (cur_mode == 0) {
+                ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.25f, 1.0f),
+                                   "INTERACTIVE MPE PIANO ROLL (TRIPLE-SLOT RCU PATTERN ARENA)");
+                if (ImGui::Button("Cycle Ratchet Sub-Steps (1..8) on Step 0")) {
+                    auto& arena = pattern_rcu_.gui_begin_edit();
+                    if (arena.note_count > 0) {
+                        arena.notes[0].ratchet_count = static_cast<uint8_t>((arena.notes[0].ratchet_count % 8) + 1);
+                    }
+                    pattern_rcu_.gui_commit_edit();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Transpose Pattern +1 Semitone")) {
+                    auto& arena = pattern_rcu_.gui_begin_edit();
+                    for (uint32_t i = 0; i < arena.note_count; ++i) {
+                        arena.notes[i].midi_key = static_cast<int16_t>(
+                            48 + ((arena.notes[i].midi_key - 47) % 36));
+                    }
+                    pattern_rcu_.gui_commit_edit();
+                }
+
+                const auto& pat = pattern_rcu_.audio_acquire();
+                ImVec2 grid_p0 = ImGui::GetCursorScreenPos();
+                ImVec2 grid_sz = ImGui::GetContentRegionAvail();
+                if (grid_sz.x > 20.0f && grid_sz.y > 40.0f) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 grid_p1(grid_p0.x + grid_sz.x, grid_p0.y + grid_sz.y);
+                    dl->AddRectFilled(grid_p0, grid_p1, IM_COL32(10, 16, 26, 255), 4.0f);
+
+                    for (int step = 0; step <= 8; ++step) {
+                        const float x = grid_p0.x + (static_cast<float>(step) / 8.0f) * grid_sz.x;
+                        dl->AddLine(ImVec2(x, grid_p0.y), ImVec2(x, grid_p1.y), IM_COL32(40, 65, 95, 140));
+                    }
+                    for (uint32_t i = 0; i < std::min(pat.note_count, 16u); ++i) {
+                        const auto& n = pat.notes[i];
+                        if (!n.active) continue;
+                        const float x0 = grid_p0.x + (n.start_beat / std::max(pat.loop_length_beats, 1.0f)) * grid_sz.x;
+                        const float x1 = x0 + (n.duration_beats / std::max(pat.loop_length_beats, 1.0f)) * grid_sz.x;
+                        const float y_norm = clampf(static_cast<float>(n.midi_key - 45) / 36.0f, 0.05f, 0.95f);
+                        const float y0 = grid_p1.y - y_norm * grid_sz.y;
+                        dl->AddRectFilled(ImVec2(x0 + 2.0f, y0 - 10.0f), ImVec2(x1 - 2.0f, y0 + 10.0f),
+                                          IM_COL32(65, 210, 245, 220), 3.0f);
+                    }
+                }
             }
-            ImGui::SameLine();
-            if (ImGui::Button("[DRAG WAV TO DAW TRACK]")) {
-                initiate_os_wav_drag_and_drop();
+            // ----------------------------------------------------------------
+            // MODE 2 (index 1): MIDI Matrix & Atomic Right-Click MIDI Learn
+            // ----------------------------------------------------------------
+            else if (cur_mode == 1) {
+                ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.25f, 1.0f),
+                                   "BIPARTITE MIDI MATRIX & ATOMIC RIGHT-CLICK MIDI LEARN");
+                const int32_t armed_pid = midi_learn_target_param_.load(std::memory_order_relaxed);
+                if (armed_pid >= 0) {
+                    ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.55f, 1.0f),
+                                       "ATOMIC MIDI LEARN ARMED FOR PARAM #%d — Move any MIDI CC knob/strip!",
+                                       armed_pid);
+                } else {
+                    ImGui::Text("Right-click any slider below to arm Atomic MIDI Learn capture:");
+                }
+                ImGui::Separator();
+                for (uint32_t pid = 0; pid < kParamCount; ++pid) {
+                    float val = get_param(pid);
+                    if (ImGui::SliderFloat(param_infos_[pid].name, &val,
+                                           static_cast<float>(param_infos_[pid].min_value),
+                                           static_cast<float>(param_infos_[pid].max_value))) {
+                        push_gui_param_change(pid, val);
+                    }
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                        midi_learn_target_param_.store(static_cast<int32_t>(pid), std::memory_order_release);
+                    }
+                }
             }
-            ImGui::Text("Recorded Stereo Frames: %llu",
-                        static_cast<unsigned long long>(last_gui_snapshot_.bounce_frames_written));
+            // ----------------------------------------------------------------
+            // MODE 3 (index 2): Live Take & Audio Bounce (32-bit Float WAV)
+            // ----------------------------------------------------------------
+            else if (cur_mode == 2) {
+                ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.25f, 1.0f),
+                                   "HOLOGRAPHIC LIVE TAKE RECORDER & 32-BIT FLOAT WAV BOUNCE");
+                bool armed = bounce_armed_.load(std::memory_order_relaxed);
+                if (ImGui::Checkbox("Auto-Start Recording on Breath / Audio Threshold", &armed)) {
+                    bounce_armed_.store(armed, std::memory_order_release);
+                }
+                if (ImGui::Button("[FINALIZE & SAVE 32-BIT FLOAT WAV]")) {
+                    trigger_save_live_take_wav("");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("[DRAG WAV TO DAW TRACK]")) {
+                    initiate_os_wav_drag_and_drop();
+                }
+                ImGui::Separator();
+                ImGui::Text("Recording Status: %s",
+                            last_gui_snapshot_.bounce_recording ? "RECORDING LIVE TAKE..." : "STANDBY");
+                ImGui::Text("Recorded Stereo Frames: %llu (%.2f sec @ %.0f Hz)",
+                            static_cast<unsigned long long>(last_gui_snapshot_.bounce_frames_written),
+                            static_cast<double>(last_gui_snapshot_.bounce_frames_written) / std::max(sample_rate_, 1.0f),
+                            sample_rate_);
+                if (!last_take_wav_path_.empty()) {
+                    ImGui::TextWrapped("Saved WAV File: %s", last_take_wav_path_.c_str());
+                }
+            }
         }
+        ImGui::EndChild();
 
-        // Mode 2: MIDI Matrix & Atomic Right-Click MIDI Learn
-        if (mode_weights_[1] > 0.1f) {
-            ImGui::Text("Right-Click any parameter to arm Atomic MIDI Learn:");
-            for (uint32_t pid = 0; pid < kParamCount; ++pid) {
-                float val = get_param(pid);
-                if (ImGui::SliderFloat(param_infos_[pid].name, &val,
+        ImGui::SameLine();
+
+        // ====================================================================
+        // RIGHT PANEL: CORE PHYSICAL MODELING & FAREY HARMONY RACK
+        // ====================================================================
+        ImGui::BeginChild("RightPhysicalDspRack", ImVec2(0.0f, avail_h), true);
+        {
+            ImGui::TextColored(ImVec4(0.28f, 0.88f, 0.96f, 1.0f), "PHYSICAL DSP & HARMONY CONTROLS");
+            ImGui::Separator();
+
+            auto param_slider = [&](clap_id pid) {
+                float v = get_param(pid);
+                if (ImGui::SliderFloat(param_infos_[pid].name, &v,
                                        static_cast<float>(param_infos_[pid].min_value),
                                        static_cast<float>(param_infos_[pid].max_value))) {
-                    push_gui_param_change(pid, val);
+                    push_gui_param_change(pid, v);
                 }
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     midi_learn_target_param_.store(static_cast<int32_t>(pid), std::memory_order_release);
                 }
-            }
-        }
+            };
 
-        // Mode 1: Interactive MPE Piano Roll with Triple-Slot RCU Pattern Arena
-        if (mode_weights_[0] > 0.1f) {
-            if (ImGui::Button("Add Ratchet Step to Pattern Slot 0")) {
-                auto& arena = pattern_rcu_.gui_begin_edit();
-                if (arena.note_count > 0) {
-                    arena.notes[0].ratchet_count = static_cast<uint8_t>((arena.notes[0].ratchet_count % 8) + 1);
-                }
-                pattern_rcu_.gui_commit_edit();
+            param_slider(kParamBreathFloor);
+            param_slider(kParamBreathCurveK);
+            param_slider(kParamBiteNotchDelta);
+            param_slider(kParamLegatoGlideMs);
+            ImGui::Separator();
+            param_slider(kParamMaterialMorph);
+            param_slider(kParamReedStiffness);
+            param_slider(kParamJetTurbulence);
+            param_slider(kParamModalDecay);
+            param_slider(kParamPlasmaDrive);
+            ImGui::Separator();
+            param_slider(kParamSvfCutoffHz);
+            param_slider(kParamSvfResonance);
+            param_slider(kParamSvfMorph);
+            ImGui::Separator();
+            param_slider(kParamFareyGravity);
+            param_slider(kParamTiltFareyOrder);
+            param_slider(kParamMicExciterGain);
+            param_slider(kParamMasterGain);
+
+            bool freeze = get_param(kParamPlasmaFreeze) > 0.5f;
+            if (ImGui::Checkbox("Plasma & Chord Freeze (Hold CC64)", &freeze)) {
+                push_gui_param_change(kParamPlasmaFreeze, freeze ? 1.0 : 0.0);
+            }
+            bool arp_on = get_param(kParamArpEnable) > 0.5f;
+            if (ImGui::Checkbox("AeroKinetic Euclidean/Tonnetz Arp", &arp_on)) {
+                push_gui_param_change(kParamArpEnable, arp_on ? 1.0 : 0.0);
             }
         }
+        ImGui::EndChild();
 
         ImGui::End();
 #endif
     }
+
+    // ========================================================================
+    // NATIVE WIN32 + WGL OPENGL + DEAR IMGUI LIFECYCLE FOR CLAP_EXT_GUI
+    // ========================================================================
+    bool gui_create(const char* api, bool is_floating) noexcept {
+        if (!api) return false;
+        gui_is_floating_ = is_floating;
+        gui_created_     = true;
+        step_gui_frame_60fps();
+
+#if defined(_WIN32)
+        if (is_floating) {
+            return create_or_attach_win32_window(nullptr);
+        }
+#endif
+        return true;
+    }
+
+    void gui_destroy() noexcept {
+#if defined(_WIN32)
+        destroy_win32_window();
+#endif
+        gui_visible_ = false;
+        gui_created_ = false;
+    }
+
+    bool gui_set_scale(double scale) noexcept {
+        gui_scale_ = static_cast<float>(std::clamp(scale, 0.5, 4.0));
+#if defined(_WIN32) && defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        if (imgui_ctx_) {
+            ImGuiContext* prev_ctx = ImGui::GetCurrentContext();
+            ImGui::SetCurrentContext(imgui_ctx_);
+            ImGui::GetIO().FontGlobalScale = gui_scale_;
+            ImGui::SetCurrentContext(prev_ctx);
+        }
+#endif
+        return true;
+    }
+
+    bool gui_set_parent(const clap_window_t* window) noexcept {
+        if (!window) return false;
+#if defined(_WIN32)
+        return create_or_attach_win32_window(reinterpret_cast<HWND>(window->win32));
+#else
+        step_gui_frame_60fps();
+        return true;
+#endif
+    }
+
+    bool gui_show() noexcept {
+        if (!gui_created_) return false;
+        gui_visible_ = true;
+#if defined(_WIN32)
+        if (!gui_hwnd_ && gui_is_floating_) {
+            if (!create_or_attach_win32_window(nullptr)) return false;
+        }
+        if (gui_hwnd_) {
+            ShowWindow(gui_hwnd_, SW_SHOW);
+            UpdateWindow(gui_hwnd_);
+            render_win32_opengl_frame();
+        }
+#else
+        step_gui_frame_60fps();
+#endif
+        return true;
+    }
+
+    bool gui_hide() noexcept {
+        gui_visible_ = false;
+#if defined(_WIN32)
+        if (gui_hwnd_) {
+            ShowWindow(gui_hwnd_, SW_HIDE);
+        }
+#endif
+        return true;
+    }
+
+    void set_gui_size(uint32_t w, uint32_t h) noexcept {
+        gui_width_  = std::clamp(w, 800u, 3840u);
+        gui_height_ = std::clamp(h, 500u, 2160u);
+#if defined(_WIN32)
+        if (gui_hwnd_) {
+            SetWindowPos(gui_hwnd_, nullptr, 0, 0,
+                         static_cast<int>(gui_width_),
+                         static_cast<int>(gui_height_),
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+#endif
+    }
+
+#if defined(_WIN32)
+    static LRESULT CALLBACK win32_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noexcept {
+        auto* self = reinterpret_cast<TectonicSynthPlugin*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        if (self && self->imgui_ctx_) {
+            ImGuiContext* prev_ctx = ImGui::GetCurrentContext();
+            ImGui::SetCurrentContext(self->imgui_ctx_);
+            const LRESULT handled = ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+            ImGui::SetCurrentContext(prev_ctx);
+            if (handled) return true;
+        }
+#endif
+
+        switch (msg) {
+            case WM_LBUTTONDOWN:
+            case WM_RBUTTONDOWN:
+            case WM_MBUTTONDOWN:
+                SetFocus(hwnd);
+                break;
+            case WM_SIZE:
+                if (self && wParam != SIZE_MINIMIZED) {
+                    const uint32_t nw = static_cast<uint32_t>(LOWORD(lParam));
+                    const uint32_t nh = static_cast<uint32_t>(HIWORD(lParam));
+                    if (nw >= 100 && nh >= 100) {
+                        self->gui_width_  = nw;
+                        self->gui_height_ = nh;
+                    }
+                    self->render_win32_opengl_frame();
+                }
+                return 0;
+            case WM_TIMER:
+                if (self && wParam == kGuiTimerId) {
+                    self->render_win32_opengl_frame();
+                    return 0;
+                }
+                break;
+            case WM_PAINT: {
+                PAINTSTRUCT ps{};
+                BeginPaint(hwnd, &ps);
+                if (self) {
+                    self->render_win32_opengl_frame();
+                }
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_ERASEBKGND:
+                return 1;
+            default:
+                break;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    bool create_or_attach_win32_window(HWND parent_hwnd) noexcept {
+        destroy_win32_window();
+
+        const HINSTANCE hinst = reinterpret_cast<HINSTANCE>(&__ImageBase);
+        static constexpr const wchar_t* kClassName = L"TectonicSynthV5_QuantumObservatory_WndClass";
+
+        WNDCLASSEXW wc{};
+        wc.cbSize        = sizeof(WNDCLASSEXW);
+        wc.style         = CS_OWNDC | CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+        wc.lpfnWndProc   = &TectonicSynthPlugin::win32_wnd_proc;
+        wc.hInstance     = hinst;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = kClassName;
+        RegisterClassExW(&wc); // Safe if already registered by another plugin instance
+
+        const DWORD style = parent_hwnd
+            ? (WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS)
+            : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+
+        gui_hwnd_ = CreateWindowExW(
+            0,
+            kClassName,
+            L"Tectonic Synth v5 — Quantum Observatory",
+            style,
+            0, 0,
+            static_cast<int>(gui_width_),
+            static_cast<int>(gui_height_),
+            parent_hwnd,
+            nullptr,
+            hinst,
+            nullptr);
+
+        if (!gui_hwnd_) {
+            return false;
+        }
+
+        SetWindowLongPtrW(gui_hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+
+        gui_hdc_ = GetDC(gui_hwnd_);
+        if (!gui_hdc_) {
+            destroy_win32_window();
+            return false;
+        }
+
+        PIXELFORMATDESCRIPTOR pfd{};
+        pfd.nSize        = sizeof(PIXELFORMATDESCRIPTOR);
+        pfd.nVersion     = 1;
+        pfd.dwFlags      = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType   = PFD_TYPE_RGBA;
+        pfd.cColorBits   = 32;
+        pfd.cDepthBits   = 24;
+        pfd.cStencilBits = 8;
+        pfd.iLayerType   = PFD_MAIN_PLANE;
+
+        const int pf = ChoosePixelFormat(gui_hdc_, &pfd);
+        if (pf == 0 || !SetPixelFormat(gui_hdc_, pf, &pfd)) {
+            destroy_win32_window();
+            return false;
+        }
+
+        gui_hglrc_ = wglCreateContext(gui_hdc_);
+        if (!gui_hglrc_) {
+            destroy_win32_window();
+            return false;
+        }
+
+        ScopedGlStateGuard gl_guard(gui_hdc_, gui_hglrc_);
+
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        ImGuiContext* prev_ctx = ImGui::GetCurrentContext();
+        imgui_ctx_ = ImGui::CreateContext();
+        ImGui::SetCurrentContext(imgui_ctx_);
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr; // Do not pollute DAW working directory with imgui.ini
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.FontGlobalScale = gui_scale_;
+
+        apply_quantum_observatory_theme();
+
+        ImGui_ImplWin32_InitForOpenGL(gui_hwnd_);
+        // GLSL #version 130 works across all WGL OpenGL 3.0+ drivers without needing a core profile loader
+        ImGui_ImplOpenGL3_Init("#version 130");
+        ImGui::SetCurrentContext(prev_ctx);
+#endif
+
+        SetTimer(gui_hwnd_, kGuiTimerId, 16, nullptr); // ~60 FPS refresh timer
+        gui_visible_ = true;
+        render_win32_opengl_frame();
+        return true;
+    }
+
+    void render_win32_opengl_frame() noexcept {
+        if (!gui_hwnd_ || !gui_hdc_ || !gui_hglrc_ || !gui_visible_) return;
+
+        ScopedGlStateGuard gl_guard(gui_hdc_, gui_hglrc_);
+
+        RECT rc{};
+        GetClientRect(gui_hwnd_, &rc);
+        const int vp_w = std::max<int>(1, rc.right - rc.left);
+        const int vp_h = std::max<int>(1, rc.bottom - rc.top);
+        gui_width_  = static_cast<uint32_t>(vp_w);
+        gui_height_ = static_cast<uint32_t>(vp_h);
+
+        glViewport(0, 0, vp_w, vp_h);
+        glClearColor(0.04f, 0.06f, 0.10f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        if (imgui_ctx_) {
+            ImGuiContext* prev_ctx = ImGui::GetCurrentContext();
+            ImGui::SetCurrentContext(imgui_ctx_);
+
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+
+            render_quantum_observatory_imgui();
+
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+            ImGui::SetCurrentContext(prev_ctx);
+        }
+#endif
+
+        SwapBuffers(gui_hdc_);
+    }
+
+    void destroy_win32_window() noexcept {
+        if (gui_hwnd_) {
+            KillTimer(gui_hwnd_, kGuiTimerId);
+        }
+
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+        if (imgui_ctx_) {
+            ScopedGlStateGuard gl_guard(gui_hdc_, gui_hglrc_);
+            ImGuiContext* prev_ctx = ImGui::GetCurrentContext();
+            const bool was_current_context = prev_ctx == imgui_ctx_;
+            ImGui::SetCurrentContext(imgui_ctx_);
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext(imgui_ctx_);
+            imgui_ctx_ = nullptr;
+            ImGui::SetCurrentContext(was_current_context ? nullptr : prev_ctx);
+        }
+#endif
+
+        if (gui_hglrc_) {
+            if (wglGetCurrentContext() == gui_hglrc_) {
+                wglMakeCurrent(nullptr, nullptr);
+            }
+            wglDeleteContext(gui_hglrc_);
+            gui_hglrc_ = nullptr;
+        }
+        if (gui_hdc_ && gui_hwnd_) {
+            ReleaseDC(gui_hwnd_, gui_hdc_);
+            gui_hdc_ = nullptr;
+        }
+        if (gui_hwnd_) {
+            SetWindowLongPtrW(gui_hwnd_, GWLP_USERDATA, 0);
+            DestroyWindow(gui_hwnd_);
+            gui_hwnd_ = nullptr;
+        }
+    }
+#endif
 
     // Quick Hardware Preset Loader for Mode 4 (Universal Hub)
     void apply_quick_hardware_preset(HardwareProfile preset) noexcept {
@@ -2681,41 +3293,6 @@ public:
     // GUI Sizing & Accessors
     uint32_t gui_width()  const noexcept { return gui_width_; }
     uint32_t gui_height() const noexcept { return gui_height_; }
-    void set_gui_size(uint32_t w, uint32_t h) noexcept {
-        gui_width_  = std::clamp(w, 800u, 3840u);
-        gui_height_ = std::clamp(h, 500u, 2160u);
-#if defined(_WIN32)
-        if (gui_window_) {
-            SetWindowPos(gui_window_, nullptr, 0, 0, static_cast<int>(gui_width_),
-                         static_cast<int>(gui_height_), SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-#endif
-    }
-#if defined(_WIN32)
-    bool create_windows_gui(bool floating) noexcept {
-        if (gui_created_) return false;
-        gui_created_ = true;
-        gui_floating_ = floating;
-        if (floating && !attach_windows_gui(nullptr, true)) {
-            gui_created_ = false;
-            gui_floating_ = false;
-            return false;
-        }
-        return true;
-    }
-    bool attach_windows_gui(void* parent, bool floating = false) noexcept;
-    bool set_windows_gui_transient(void* parent) noexcept;
-    void destroy_windows_gui() noexcept;
-    bool show_windows_gui(bool visible) noexcept;
-    void suggest_windows_gui_title(const char* title) noexcept;
-    void resize_windows_gui() noexcept;
-    void handle_windows_command(unsigned int control_id) noexcept;
-    void handle_windows_scroll(unsigned int control_id, int position) noexcept;
-    bool is_windows_gui_created() const noexcept { return gui_created_; }
-    void on_windows_gui_destroyed(void* window) noexcept {
-        if (gui_window_ == window) gui_window_ = nullptr;
-    }
-#endif
 
 private:
     void init_default_parameters() noexcept {
@@ -2817,244 +3394,20 @@ private:
     std::array<float, 4> mode_weights_{0.0f, 0.0f, 0.0f, 1.0f};
     uint32_t            gui_width_{1280};
     uint32_t            gui_height_{800};
-#if defined(_WIN32)
-    HWND                gui_window_{nullptr};
+    float               gui_scale_{1.0f};
     bool                gui_created_{false};
-    bool                gui_floating_{false};
-#endif
-};
-
+    bool                gui_visible_{false};
+    bool                gui_is_floating_{false};
 #if defined(_WIN32)
-namespace {
-enum WindowsGuiControl : unsigned int {
-    kGuiModePiano = 1001,
-    kGuiModeMidi = 1002,
-    kGuiModeBounce = 1003,
-    kGuiModeHub = 1004,
-    kGuiMaterial = 1101,
-    kGuiCutoff = 1102,
-    kGuiMaster = 1103,
-    kGuiTitle = 1200,
-    kGuiMaterialLabel = 1201,
-    kGuiCutoffLabel = 1202,
-    kGuiMasterLabel = 1203
-};
-
-constexpr wchar_t kWindowsGuiClassName[] = L"TectonicSynthV5ClapGui";
-
-static LRESULT CALLBACK windows_gui_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    auto* plugin = reinterpret_cast<TectonicSynthPlugin*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
-        plugin = static_cast<TectonicSynthPlugin*>(create->lpCreateParams);
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(plugin));
-    }
-
-    switch (message) {
-        case WM_CLOSE:
-            ShowWindow(window, SW_HIDE);
-            return 0;
-        case WM_CREATE: {
-            const auto hinstance = GetModuleHandleW(nullptr);
-            const auto make_control = [window, hinstance](DWORD ex_style, const wchar_t* type,
-                                                          const wchar_t* text, DWORD style,
-                                                          int x, int y, int width, int height,
-                                                          unsigned int id) {
-                return CreateWindowExW(ex_style, type, text, style, x, y, width, height,
-                                       window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                       hinstance, nullptr);
-            };
-            if (!make_control(0, L"STATIC", L"TECTONIC SYNTH V5  |  QUANTUM OBSERVATORY",
-                              WS_CHILD | WS_VISIBLE, 24, 18, 700, 32, kGuiTitle) ||
-                !make_control(0, L"BUTTON", L"1. MPE Piano Roll",
-                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 24, 62, 170, 34, kGuiModePiano) ||
-                !make_control(0, L"BUTTON", L"2. MIDI Matrix",
-                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 204, 62, 170, 34, kGuiModeMidi) ||
-                !make_control(0, L"BUTTON", L"3. Live Take",
-                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 384, 62, 170, 34, kGuiModeBounce) ||
-                !make_control(0, L"BUTTON", L"4. Aerophone / Mic",
-                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 564, 62, 190, 34, kGuiModeHub) ||
-                !make_control(0, L"STATIC", L"Material Morph",
-                              WS_CHILD | WS_VISIBLE, 24, 132, 240, 24, kGuiMaterialLabel) ||
-                !make_control(0, TRACKBAR_CLASSW, L"",
-                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ, 24, 158, 720, 42, kGuiMaterial) ||
-                !make_control(0, L"STATIC", L"Filter Cutoff",
-                              WS_CHILD | WS_VISIBLE, 24, 232, 240, 24, kGuiCutoffLabel) ||
-                !make_control(0, TRACKBAR_CLASSW, L"",
-                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ, 24, 258, 720, 42, kGuiCutoff) ||
-                !make_control(0, L"STATIC", L"Master Output",
-                              WS_CHILD | WS_VISIBLE, 24, 332, 240, 24, kGuiMasterLabel) ||
-                !make_control(0, TRACKBAR_CLASSW, L"",
-                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ, 24, 358, 720, 42, kGuiMaster)) {
-                return -1;
-            }
-
-            const auto material = GetDlgItem(window, kGuiMaterial);
-            SendMessageW(material, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
-            SendMessageW(material, TBM_SETPOS, TRUE,
-                         static_cast<LPARAM>(std::lround(plugin->get_param(kParamMaterialMorph) * 100.0f)));
-
-            const auto cutoff = GetDlgItem(window, kGuiCutoff);
-            SendMessageW(cutoff, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
-            const auto cutoff_norm = std::log(plugin->get_param(kParamSvfCutoffHz) / 40.0f) /
-                                     std::log(18000.0f / 40.0f);
-            SendMessageW(cutoff, TBM_SETPOS, TRUE,
-                         static_cast<LPARAM>(std::lround(cutoff_norm * 100.0f)));
-
-            const auto master = GetDlgItem(window, kGuiMaster);
-            SendMessageW(master, TBM_SETRANGE, TRUE, MAKELONG(0, 150));
-            SendMessageW(master, TBM_SETPOS, TRUE,
-                         static_cast<LPARAM>(std::lround(plugin->get_param(kParamMasterGain) * 100.0f)));
-            return 0;
-        }
-        case WM_SIZE:
-            if (plugin) plugin->resize_windows_gui();
-            return 0;
-        case WM_COMMAND:
-            if (plugin && HIWORD(wparam) == BN_CLICKED) {
-                plugin->handle_windows_command(LOWORD(wparam));
-                return 0;
-            }
-            break;
-        case WM_HSCROLL:
-            if (plugin && lparam != 0) {
-                const auto control = reinterpret_cast<HWND>(lparam);
-                plugin->handle_windows_scroll(static_cast<unsigned int>(GetDlgCtrlID(control)),
-                                              static_cast<int>(SendMessageW(control, TBM_GETPOS, 0, 0)));
-                return 0;
-            }
-            break;
-        case WM_NCDESTROY:
-            if (plugin) plugin->on_windows_gui_destroyed(window);
-            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-            break;
-    }
-
-    return DefWindowProcW(window, message, wparam, lparam);
-}
-} // namespace
-
-bool TectonicSynthPlugin::attach_windows_gui(void* parent, bool floating) noexcept {
-    if (!gui_created_ || floating != gui_floating_ ||
-        (floating ? parent != nullptr : (!parent || !IsWindow(static_cast<HWND>(parent))))) {
-        return false;
-    }
-
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
-    if (!InitCommonControlsEx(&controls)) return false;
-    HMODULE plugin_module = nullptr;
-    const auto wnd_proc_address =
-        reinterpret_cast<LPCWSTR>(reinterpret_cast<std::uintptr_t>(&windows_gui_window_proc));
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            wnd_proc_address, &plugin_module)) {
-        return false;
-    }
-
-    WNDCLASSEXW window_class{};
-    window_class.cbSize = sizeof(window_class);
-    window_class.style = CS_OWNDC;
-    window_class.lpfnWndProc = windows_gui_window_proc;
-    window_class.hInstance = plugin_module;
-    window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    window_class.lpszClassName = kWindowsGuiClassName;
-    if (!RegisterClassExW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
-
-    if (gui_window_) DestroyWindow(gui_window_);
-    const DWORD style = floating
-        ? WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS | WS_CLIPCHILDREN
-        : WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
-    gui_window_ = CreateWindowExW(0, kWindowsGuiClassName, L"Tectonic Synth v5",
-                                  style,
-                                  0, 0, static_cast<int>(gui_width_), static_cast<int>(gui_height_),
-                                  static_cast<HWND>(parent), nullptr, window_class.hInstance, this);
-    return gui_window_ != nullptr;
-}
-
-bool TectonicSynthPlugin::set_windows_gui_transient(void* parent) noexcept {
-    if (!gui_created_ || !gui_floating_ || !gui_window_ ||
-        !parent || !IsWindow(static_cast<HWND>(parent))) {
-        return false;
-    }
-    SetLastError(ERROR_SUCCESS);
-    const auto previous = SetWindowLongPtrW(
-        gui_window_, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(parent));
-    return previous != 0 || GetLastError() == ERROR_SUCCESS;
-}
-
-void TectonicSynthPlugin::destroy_windows_gui() noexcept {
-    gui_created_ = false;
-    gui_floating_ = false;
-    if (gui_window_) DestroyWindow(gui_window_);
-}
-
-bool TectonicSynthPlugin::show_windows_gui(bool visible) noexcept {
-    if (!gui_window_ || !IsWindow(gui_window_)) return false;
-    ShowWindow(gui_window_, visible ? SW_SHOW : SW_HIDE);
-    if (visible) UpdateWindow(gui_window_);
-    return true;
-}
-
-void TectonicSynthPlugin::suggest_windows_gui_title(const char* title) noexcept {
-    if (gui_window_ && title) {
-        const auto wide_title = std::wstring(title, title + std::strlen(title));
-        SetWindowTextW(gui_window_, wide_title.c_str());
-    }
-}
-
-void TectonicSynthPlugin::resize_windows_gui() noexcept {
-    if (!gui_window_) return;
-    RECT client{};
-    if (!GetClientRect(gui_window_, &client)) return;
-    const int width = client.right - client.left;
-    const int content_width = std::max(240, width - 48);
-    const auto move_control = [this, content_width](int id, int x, int y, int w, int h) {
-        if (const auto control = GetDlgItem(gui_window_, id)) {
-            MoveWindow(control, x, y, w == -1 ? content_width : w, h, TRUE);
-        }
-    };
-
-    move_control(kGuiTitle, 24, 18, -1, 32);
-    move_control(kGuiModePiano, 24, 62, 170, 34);
-    move_control(kGuiModeMidi, 204, 62, 170, 34);
-    move_control(kGuiModeBounce, 384, 62, 170, 34);
-    move_control(kGuiModeHub, 564, 62, 190, 34);
-    move_control(kGuiMaterialLabel, 24, 132, 240, 24);
-    move_control(kGuiMaterial, 24, 158, -1, 42);
-    move_control(kGuiCutoffLabel, 24, 232, 240, 24);
-    move_control(kGuiCutoff, 24, 258, -1, 42);
-    move_control(kGuiMasterLabel, 24, 332, 240, 24);
-    move_control(kGuiMaster, 24, 358, -1, 42);
-}
-
-void TectonicSynthPlugin::handle_windows_command(unsigned int control_id) noexcept {
-    switch (control_id) {
-        case kGuiModePiano: push_gui_param_change(kParamUiMode, 0.0); break;
-        case kGuiModeMidi: push_gui_param_change(kParamUiMode, 1.0); break;
-        case kGuiModeBounce: push_gui_param_change(kParamUiMode, 2.0); break;
-        case kGuiModeHub: push_gui_param_change(kParamUiMode, 3.0); break;
-        default: break;
-    }
-}
-
-void TectonicSynthPlugin::handle_windows_scroll(unsigned int control_id, int position) noexcept {
-    switch (control_id) {
-        case kGuiMaterial:
-            push_gui_param_change(kParamMaterialMorph, std::clamp(position / 100.0, 0.0, 1.0));
-            break;
-        case kGuiCutoff: {
-            const double normalized = std::clamp(position / 100.0, 0.0, 1.0);
-            push_gui_param_change(kParamSvfCutoffHz, 40.0 * std::pow(18000.0 / 40.0, normalized));
-            break;
-        }
-        case kGuiMaster:
-            push_gui_param_change(kParamMasterGain, std::clamp(position / 100.0, 0.0, 1.5));
-            break;
-        default: break;
-    }
-}
+    static constexpr UINT_PTR kGuiTimerId = 0x54454335u;
+    HWND                gui_hwnd_{nullptr};
+    HDC                 gui_hdc_{nullptr};
+    HGLRC               gui_hglrc_{nullptr};
 #endif
+#if defined(TECTONIC_HAS_IMGUI_OPENGL) && __has_include(<imgui.h>)
+    ImGuiContext*       imgui_ctx_{nullptr};
+#endif
+};
 
 // ============================================================================
 // SECTION IX: CLAP C-ABI EXTENSION TABLES & FACTORY ENTRY POINT
@@ -3208,48 +3561,45 @@ static const clap_plugin_state_t kExtState = {
     ext_state_load
 };
 
-// 5. CLAP_EXT_GUI (Quantum Observatory 60 FPS Window & Resize Protocol)
-static bool CLAP_ABI ext_gui_is_api_supported(const clap_plugin_t*, const char* api, bool is_floating) {
+// 5. CLAP_EXT_GUI (Quantum Observatory 60 FPS Native Win32 + OpenGL + ImGui Protocol)
+static bool CLAP_ABI ext_gui_is_api_supported(const clap_plugin_t*, const char* api, bool /*is_floating*/) {
     if (!api) return false;
 #if defined(_WIN32)
-    (void)is_floating;
-    return std::strcmp(api, CLAP_WINDOW_API_WIN32) == 0;
+    // Strictly match standard CLAP 1.2 identifier "win32"
+    return std::strcmp(api, "win32") == 0;
+#elif defined(__APPLE__)
+    return std::strcmp(api, "cocoa") == 0;
 #else
-    return false;
+    return std::strcmp(api, "x11") == 0;
 #endif
 }
 
 static bool CLAP_ABI ext_gui_get_preferred_api(
     const clap_plugin_t*, const char** api, bool* is_floating) {
     if (!api || !is_floating) return false;
+    *is_floating = false; // Prefer embedded DAW window in Bitwig Studio
 #if defined(_WIN32)
-    *is_floating = false;
-    *api = CLAP_WINDOW_API_WIN32;
-    return true;
+    *api = "win32";
+#elif defined(__APPLE__)
+    *api = "cocoa";
 #else
-    *api = nullptr;
-    *is_floating = false;
-    return false;
+    *api = "x11";
 #endif
+    return true;
 }
 
 static bool CLAP_ABI ext_gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) {
     if (!ext_gui_is_api_supported(plugin, api, is_floating)) return false;
-#if defined(_WIN32)
-    return self_from_plugin(plugin)->create_windows_gui(is_floating);
-#else
-    return false;
-#endif
+    return self_from_plugin(plugin)->gui_create(api, is_floating);
 }
 
 static void CLAP_ABI ext_gui_destroy(const clap_plugin_t* plugin) {
-#if defined(_WIN32)
-    self_from_plugin(plugin)->destroy_windows_gui();
-#else
-    (void)plugin;
-#endif
+    self_from_plugin(plugin)->gui_destroy();
 }
-static bool CLAP_ABI ext_gui_set_scale(const clap_plugin_t*, double) { return false; }
+
+static bool CLAP_ABI ext_gui_set_scale(const clap_plugin_t* plugin, double scale) {
+    return self_from_plugin(plugin)->gui_set_scale(scale);
+}
 
 static bool CLAP_ABI ext_gui_get_size(
     const clap_plugin_t* plugin, uint32_t* width, uint32_t* height) {
@@ -3267,7 +3617,7 @@ static bool CLAP_ABI ext_gui_get_resize_hints(
     if (!hints) return false;
     hints->can_resize_horizontally = true;
     hints->can_resize_vertically   = true;
-    hints->preserve_aspect_ratio   = true;
+    hints->preserve_aspect_ratio   = false;
     hints->aspect_ratio_width      = 16;
     hints->aspect_ratio_height     = 10;
     return true;
@@ -3283,57 +3633,23 @@ static bool CLAP_ABI ext_gui_adjust_size(
 
 static bool CLAP_ABI ext_gui_set_size(
     const clap_plugin_t* plugin, uint32_t width, uint32_t height) {
-    auto* self = self_from_plugin(plugin);
-    self->set_gui_size(width, height);
+    self_from_plugin(plugin)->set_gui_size(width, height);
     return true;
 }
 
 static bool CLAP_ABI ext_gui_set_parent(const clap_plugin_t* plugin, const clap_window_t* window) {
-#if defined(_WIN32)
-    return window && window->api && std::strcmp(window->api, CLAP_WINDOW_API_WIN32) == 0 &&
-           self_from_plugin(plugin)->attach_windows_gui(window->win32, false);
-#else
-    (void)plugin;
-    (void)window;
-    return false;
-#endif
+    return self_from_plugin(plugin)->gui_set_parent(window);
 }
 
-static bool CLAP_ABI ext_gui_set_transient(const clap_plugin_t* plugin, const clap_window_t* window) {
-#if defined(_WIN32)
-    return window && window->api && std::strcmp(window->api, CLAP_WINDOW_API_WIN32) == 0 &&
-           self_from_plugin(plugin)->set_windows_gui_transient(window->win32);
-#else
-    (void)plugin;
-    (void)window;
-    return false;
-#endif
-}
-static void CLAP_ABI ext_gui_suggest_title(const clap_plugin_t* plugin, const char* title) {
-#if defined(_WIN32)
-    self_from_plugin(plugin)->suggest_windows_gui_title(title);
-#else
-    (void)plugin;
-    (void)title;
-#endif
-}
+static bool CLAP_ABI ext_gui_set_transient(const clap_plugin_t*, const clap_window_t*) { return true; }
+static void CLAP_ABI ext_gui_suggest_title(const clap_plugin_t*, const char*) {}
 
 static bool CLAP_ABI ext_gui_show(const clap_plugin_t* plugin) {
-#if defined(_WIN32)
-    return self_from_plugin(plugin)->show_windows_gui(true);
-#else
-    (void)plugin;
-    return false;
-#endif
+    return self_from_plugin(plugin)->gui_show();
 }
 
 static bool CLAP_ABI ext_gui_hide(const clap_plugin_t* plugin) {
-#if defined(_WIN32)
-    return self_from_plugin(plugin)->show_windows_gui(false);
-#else
-    (void)plugin;
-    return false;
-#endif
+    return self_from_plugin(plugin)->gui_hide();
 }
 
 static const clap_plugin_gui_t kExtGui = {
