@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    if: github.ref != 'refs/tags/v5.0.1-windows-gui' && github.ref != 'refs/tags/v5.0.2-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui-fixed'
+    if: github.ref != 'refs/tags/v5.0.1-windows-gui' && github.ref != 'refs/tags/v5.0.2-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui-fixed' && github.ref != 'refs/tags/v5.1.0-windows-russian'
     name: Build and Package (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -133,7 +133,7 @@ jobs:
 
   release:
     name: Publish GitHub Release and installers
-    if: startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v5.0.1-windows-gui' && github.ref != 'refs/tags/v5.0.2-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui-fixed'
+    if: startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v5.0.1-windows-gui' && github.ref != 'refs/tags/v5.0.2-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui' && github.ref != 'refs/tags/v5.0.3-windows-gui-fixed' && github.ref != 'refs/tags/v5.1.0-windows-russian'
     needs: build
     runs-on: ubuntu-latest
     permissions:
