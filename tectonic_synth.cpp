@@ -96,7 +96,7 @@ static constexpr const char CLAP_EXT_STATE[]       = "clap.state";
 static constexpr const char CLAP_EXT_GUI[]         = "clap.gui";
 
 static constexpr const char CLAP_PORT_STEREO[] = "stereo";
-static constexpr const char CLAP_WINDOW_API_WIN32[] = "clap.window.win32";
+static constexpr const char CLAP_WINDOW_API_WIN32[] = "win32";
 static constexpr const char CLAP_WINDOW_API_COCOA[] = "cocoa";
 static constexpr const char CLAP_WINDOW_API_X11[]   = "x11";
 
@@ -2692,14 +2692,22 @@ public:
 #endif
     }
 #if defined(_WIN32)
-    bool create_windows_gui() noexcept {
+    bool create_windows_gui(bool floating) noexcept {
         if (gui_created_) return false;
         gui_created_ = true;
+        gui_floating_ = floating;
+        if (floating && !attach_windows_gui(nullptr, true)) {
+            gui_created_ = false;
+            gui_floating_ = false;
+            return false;
+        }
         return true;
     }
-    bool attach_windows_gui(void* parent) noexcept;
+    bool attach_windows_gui(void* parent, bool floating = false) noexcept;
+    bool set_windows_gui_transient(void* parent) noexcept;
     void destroy_windows_gui() noexcept;
-    void show_windows_gui(bool visible) noexcept;
+    bool show_windows_gui(bool visible) noexcept;
+    void suggest_windows_gui_title(const char* title) noexcept;
     void resize_windows_gui() noexcept;
     void handle_windows_command(unsigned int control_id) noexcept;
     void handle_windows_scroll(unsigned int control_id, int position) noexcept;
@@ -2812,6 +2820,7 @@ private:
 #if defined(_WIN32)
     HWND                gui_window_{nullptr};
     bool                gui_created_{false};
+    bool                gui_floating_{false};
 #endif
 };
 
@@ -2842,6 +2851,9 @@ static LRESULT CALLBACK windows_gui_window_proc(HWND window, UINT message, WPARA
     }
 
     switch (message) {
+        case WM_CLOSE:
+            ShowWindow(window, SW_HIDE);
+            return 0;
         case WM_CREATE: {
             const auto hinstance = GetModuleHandleW(nullptr);
             const auto make_control = [window, hinstance](DWORD ex_style, const wchar_t* type,
@@ -2922,8 +2934,11 @@ static LRESULT CALLBACK windows_gui_window_proc(HWND window, UINT message, WPARA
 }
 } // namespace
 
-bool TectonicSynthPlugin::attach_windows_gui(void* parent) noexcept {
-    if (!gui_created_ || !parent || !IsWindow(static_cast<HWND>(parent))) return false;
+bool TectonicSynthPlugin::attach_windows_gui(void* parent, bool floating) noexcept {
+    if (!gui_created_ || floating != gui_floating_ ||
+        (floating ? parent != nullptr : (!parent || !IsWindow(static_cast<HWND>(parent))))) {
+        return false;
+    }
 
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
     if (!InitCommonControlsEx(&controls)) return false;
@@ -2947,22 +2962,45 @@ bool TectonicSynthPlugin::attach_windows_gui(void* parent) noexcept {
     if (!RegisterClassExW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
     if (gui_window_) DestroyWindow(gui_window_);
+    const DWORD style = floating
+        ? WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS | WS_CLIPCHILDREN
+        : WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
     gui_window_ = CreateWindowExW(0, kWindowsGuiClassName, L"Tectonic Synth v5",
-                                  WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                  style,
                                   0, 0, static_cast<int>(gui_width_), static_cast<int>(gui_height_),
                                   static_cast<HWND>(parent), nullptr, window_class.hInstance, this);
     return gui_window_ != nullptr;
 }
 
+bool TectonicSynthPlugin::set_windows_gui_transient(void* parent) noexcept {
+    if (!gui_created_ || !gui_floating_ || !gui_window_ ||
+        !parent || !IsWindow(static_cast<HWND>(parent))) {
+        return false;
+    }
+    SetLastError(ERROR_SUCCESS);
+    const auto previous = SetWindowLongPtrW(
+        gui_window_, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(parent));
+    return previous != 0 || GetLastError() == ERROR_SUCCESS;
+}
+
 void TectonicSynthPlugin::destroy_windows_gui() noexcept {
     gui_created_ = false;
+    gui_floating_ = false;
     if (gui_window_) DestroyWindow(gui_window_);
 }
 
-void TectonicSynthPlugin::show_windows_gui(bool visible) noexcept {
-    if (!gui_window_) return;
+bool TectonicSynthPlugin::show_windows_gui(bool visible) noexcept {
+    if (!gui_window_ || !IsWindow(gui_window_)) return false;
     ShowWindow(gui_window_, visible ? SW_SHOW : SW_HIDE);
     if (visible) UpdateWindow(gui_window_);
+    return true;
+}
+
+void TectonicSynthPlugin::suggest_windows_gui_title(const char* title) noexcept {
+    if (gui_window_ && title) {
+        const auto wide_title = std::wstring(title, title + std::strlen(title));
+        SetWindowTextW(gui_window_, wide_title.c_str());
+    }
 }
 
 void TectonicSynthPlugin::resize_windows_gui() noexcept {
@@ -3172,8 +3210,9 @@ static const clap_plugin_state_t kExtState = {
 
 // 5. CLAP_EXT_GUI (Quantum Observatory 60 FPS Window & Resize Protocol)
 static bool CLAP_ABI ext_gui_is_api_supported(const clap_plugin_t*, const char* api, bool is_floating) {
-    if (is_floating || !api) return false;
+    if (!api) return false;
 #if defined(_WIN32)
+    (void)is_floating;
     return std::strcmp(api, CLAP_WINDOW_API_WIN32) == 0;
 #else
     return false;
@@ -3197,7 +3236,7 @@ static bool CLAP_ABI ext_gui_get_preferred_api(
 static bool CLAP_ABI ext_gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) {
     if (!ext_gui_is_api_supported(plugin, api, is_floating)) return false;
 #if defined(_WIN32)
-    return self_from_plugin(plugin)->create_windows_gui();
+    return self_from_plugin(plugin)->create_windows_gui(is_floating);
 #else
     return false;
 #endif
@@ -3252,7 +3291,7 @@ static bool CLAP_ABI ext_gui_set_size(
 static bool CLAP_ABI ext_gui_set_parent(const clap_plugin_t* plugin, const clap_window_t* window) {
 #if defined(_WIN32)
     return window && window->api && std::strcmp(window->api, CLAP_WINDOW_API_WIN32) == 0 &&
-           self_from_plugin(plugin)->attach_windows_gui(window->win32);
+           self_from_plugin(plugin)->attach_windows_gui(window->win32, false);
 #else
     (void)plugin;
     (void)window;
@@ -3260,25 +3299,41 @@ static bool CLAP_ABI ext_gui_set_parent(const clap_plugin_t* plugin, const clap_
 #endif
 }
 
-static bool CLAP_ABI ext_gui_set_transient(const clap_plugin_t*, const clap_window_t*) { return true; }
-static void CLAP_ABI ext_gui_suggest_title(const clap_plugin_t*, const char*) {}
+static bool CLAP_ABI ext_gui_set_transient(const clap_plugin_t* plugin, const clap_window_t* window) {
+#if defined(_WIN32)
+    return window && window->api && std::strcmp(window->api, CLAP_WINDOW_API_WIN32) == 0 &&
+           self_from_plugin(plugin)->set_windows_gui_transient(window->win32);
+#else
+    (void)plugin;
+    (void)window;
+    return false;
+#endif
+}
+static void CLAP_ABI ext_gui_suggest_title(const clap_plugin_t* plugin, const char* title) {
+#if defined(_WIN32)
+    self_from_plugin(plugin)->suggest_windows_gui_title(title);
+#else
+    (void)plugin;
+    (void)title;
+#endif
+}
 
 static bool CLAP_ABI ext_gui_show(const clap_plugin_t* plugin) {
 #if defined(_WIN32)
-    self_from_plugin(plugin)->show_windows_gui(true);
+    return self_from_plugin(plugin)->show_windows_gui(true);
 #else
     (void)plugin;
+    return false;
 #endif
-    return true;
 }
 
 static bool CLAP_ABI ext_gui_hide(const clap_plugin_t* plugin) {
 #if defined(_WIN32)
-    self_from_plugin(plugin)->show_windows_gui(false);
+    return self_from_plugin(plugin)->show_windows_gui(false);
 #else
     (void)plugin;
+    return false;
 #endif
-    return true;
 }
 
 static const clap_plugin_gui_t kExtGui = {
@@ -3316,7 +3371,7 @@ static const clap_plugin_descriptor_t kPluginDescriptor = {
     "https://github.com/tectonic-audio/tectonic-synth-v5",
     "https://github.com/tectonic-audio/tectonic-synth-v5/wiki",
     "https://github.com/tectonic-audio/tectonic-synth-v5/issues",
-    "5.0.2",
+    "5.0.3",
     "Ultra-Performance Physical Waveguide, 64-Mode Spectral Plasma & Farey Lattice CLAP Synthesizer",
     kPluginFeatures
 };

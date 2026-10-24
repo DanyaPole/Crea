@@ -311,7 +311,7 @@ typedef struct clap_plugin_entry {
     const void *(CLAP_ABI *get_factory)(const char *factory_id);
 } clap_plugin_entry_t;
 
-#define CLAP_WINDOW_API_WIN32 "clap.window.win32"
+#define CLAP_WINDOW_API_WIN32 "win32"
 #define CLAP_WINDOW_API_NS_VIEW "clap.window.ns-view"
 #define CLAP_WINDOW_API_X11 "clap.window.x11"
 #define CLAP_EXT_GUI "clap.gui"

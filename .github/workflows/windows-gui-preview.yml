@@ -2,7 +2,7 @@ name: Build Windows GUI Preview
 
 on:
   push:
-    tags: ["v5.0.2-windows-gui"]
+    tags: ["v5.0.3-windows-gui"]
   workflow_dispatch:
 
 permissions:
@@ -48,7 +48,7 @@ jobs:
 
   publish-preview:
     name: Publish Windows GUI preview
-    if: github.ref == 'refs/tags/v5.0.2-windows-gui'
+    if: github.ref == 'refs/tags/v5.0.3-windows-gui'
     needs: build-windows
     runs-on: ubuntu-latest
     permissions:
@@ -62,7 +62,7 @@ jobs:
       - name: Publish prerelease
         uses: softprops/action-gh-release@v2
         with:
-          name: Tectonic Synth v5.0.2 Windows GUI Preview
+          name: Tectonic Synth v5.0.3 Windows GUI Preview
           files: release_assets/*
           prerelease: true
           make_latest: false
