@@ -96,7 +96,7 @@ static constexpr const char CLAP_EXT_STATE[]       = "clap.state";
 static constexpr const char CLAP_EXT_GUI[]         = "clap.gui";
 
 static constexpr const char CLAP_PORT_STEREO[] = "stereo";
-static constexpr const char CLAP_WINDOW_API_WIN32[] = "win32";
+static constexpr const char CLAP_WINDOW_API_WIN32[] = "clap.window.win32";
 static constexpr const char CLAP_WINDOW_API_COCOA[] = "cocoa";
 static constexpr const char CLAP_WINDOW_API_X11[]   = "x11";
 
@@ -3316,7 +3316,7 @@ static const clap_plugin_descriptor_t kPluginDescriptor = {
     "https://github.com/tectonic-audio/tectonic-synth-v5",
     "https://github.com/tectonic-audio/tectonic-synth-v5/wiki",
     "https://github.com/tectonic-audio/tectonic-synth-v5/issues",
-    "5.0.1",
+    "5.0.2",
     "Ultra-Performance Physical Waveguide, 64-Mode Spectral Plasma & Farey Lattice CLAP Synthesizer",
     kPluginFeatures
 };
