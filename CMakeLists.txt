@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(TectonicSynthV5 VERSION 5.0.0 LANGUAGES C CXX)
+project(TectonicSynthV5 VERSION 5.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,8 +77,8 @@ if(APPLE)
         OUTPUT_NAME "TectonicSynthV5"
         MACOSX_BUNDLE_GUI_IDENTIFIER "org.tectonic-audio.tectonic-synth-v5"
         MACOSX_BUNDLE_BUNDLE_NAME "TectonicSynthV5"
-        MACOSX_BUNDLE_BUNDLE_VERSION "5.0.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "5.0.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "5.0.1"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "5.0.1"
     )
     target_link_libraries(TectonicSynthV5 PRIVATE
         "-framework Cocoa"
@@ -91,7 +91,7 @@ elseif(WIN32)
         OUTPUT_NAME "TectonicSynthV5"
         SUFFIX ".clap"
     )
-    target_link_libraries(TectonicSynthV5 PRIVATE opengl32 gdi32 user32 shell32 ole32)
+    target_link_libraries(TectonicSynthV5 PRIVATE opengl32 gdi32 user32 shell32 ole32 comctl32)
 else()
     # Linux X11 + OpenGL + pthread
     find_package(Threads REQUIRED)
@@ -122,7 +122,7 @@ set(CPACK_PACKAGE_VENDOR "Tectonic Audio Research Lab")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Tectonic Synth v5 — Quantum Observatory CLAP Synthesizer")
 set(CPACK_PACKAGE_VERSION_MAJOR 5)
 set(CPACK_PACKAGE_VERSION_MINOR 0)
-set(CPACK_PACKAGE_VERSION_PATCH 0)
+set(CPACK_PACKAGE_VERSION_PATCH 1)
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "TectonicSynthV5")
 
 if(WIN32)

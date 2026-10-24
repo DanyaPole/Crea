@@ -39,6 +39,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commctrl.h>
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #define TECTONIC_ARCH_X64 1
@@ -1711,6 +1719,9 @@ public:
     }
 
     ~TectonicSynthPlugin() {
+#if defined(_WIN32)
+        destroy_windows_gui();
+#endif
         stop_disk_writer_thread();
     }
 
@@ -2673,7 +2684,30 @@ public:
     void set_gui_size(uint32_t w, uint32_t h) noexcept {
         gui_width_  = std::clamp(w, 800u, 3840u);
         gui_height_ = std::clamp(h, 500u, 2160u);
+#if defined(_WIN32)
+        if (gui_window_) {
+            SetWindowPos(gui_window_, nullptr, 0, 0, static_cast<int>(gui_width_),
+                         static_cast<int>(gui_height_), SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+#endif
     }
+#if defined(_WIN32)
+    bool create_windows_gui() noexcept {
+        if (gui_created_) return false;
+        gui_created_ = true;
+        return true;
+    }
+    bool attach_windows_gui(void* parent) noexcept;
+    void destroy_windows_gui() noexcept;
+    void show_windows_gui(bool visible) noexcept;
+    void resize_windows_gui() noexcept;
+    void handle_windows_command(unsigned int control_id) noexcept;
+    void handle_windows_scroll(unsigned int control_id, int position) noexcept;
+    bool is_windows_gui_created() const noexcept { return gui_created_; }
+    void on_windows_gui_destroyed(void* window) noexcept {
+        if (gui_window_ == window) gui_window_ = nullptr;
+    }
+#endif
 
 private:
     void init_default_parameters() noexcept {
@@ -2775,7 +2809,214 @@ private:
     std::array<float, 4> mode_weights_{0.0f, 0.0f, 0.0f, 1.0f};
     uint32_t            gui_width_{1280};
     uint32_t            gui_height_{800};
+#if defined(_WIN32)
+    HWND                gui_window_{nullptr};
+    bool                gui_created_{false};
+#endif
 };
+
+#if defined(_WIN32)
+namespace {
+enum WindowsGuiControl : unsigned int {
+    kGuiModePiano = 1001,
+    kGuiModeMidi = 1002,
+    kGuiModeBounce = 1003,
+    kGuiModeHub = 1004,
+    kGuiMaterial = 1101,
+    kGuiCutoff = 1102,
+    kGuiMaster = 1103,
+    kGuiTitle = 1200,
+    kGuiMaterialLabel = 1201,
+    kGuiCutoffLabel = 1202,
+    kGuiMasterLabel = 1203
+};
+
+constexpr wchar_t kWindowsGuiClassName[] = L"TectonicSynthV5ClapGui";
+
+static LRESULT CALLBACK windows_gui_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    auto* plugin = reinterpret_cast<TectonicSynthPlugin*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+        plugin = static_cast<TectonicSynthPlugin*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(plugin));
+    }
+
+    switch (message) {
+        case WM_CREATE: {
+            const auto hinstance = GetModuleHandleW(nullptr);
+            const auto make_control = [window, hinstance](DWORD ex_style, const wchar_t* type,
+                                                          const wchar_t* text, DWORD style,
+                                                          int x, int y, int width, int height,
+                                                          unsigned int id) {
+                return CreateWindowExW(ex_style, type, text, style, x, y, width, height,
+                                       window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                       hinstance, nullptr);
+            };
+            if (!make_control(0, L"STATIC", L"TECTONIC SYNTH V5  |  QUANTUM OBSERVATORY",
+                              WS_CHILD | WS_VISIBLE, 24, 18, 700, 32, kGuiTitle) ||
+                !make_control(0, L"BUTTON", L"1. MPE Piano Roll",
+                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 24, 62, 170, 34, kGuiModePiano) ||
+                !make_control(0, L"BUTTON", L"2. MIDI Matrix",
+                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 204, 62, 170, 34, kGuiModeMidi) ||
+                !make_control(0, L"BUTTON", L"3. Live Take",
+                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 384, 62, 170, 34, kGuiModeBounce) ||
+                !make_control(0, L"BUTTON", L"4. Aerophone / Mic",
+                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 564, 62, 190, 34, kGuiModeHub) ||
+                !make_control(0, L"STATIC", L"Material Morph",
+                              WS_CHILD | WS_VISIBLE, 24, 132, 240, 24, kGuiMaterialLabel) ||
+                !make_control(0, TRACKBAR_CLASSW, L"",
+                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ, 24, 158, 720, 42, kGuiMaterial) ||
+                !make_control(0, L"STATIC", L"Filter Cutoff",
+                              WS_CHILD | WS_VISIBLE, 24, 232, 240, 24, kGuiCutoffLabel) ||
+                !make_control(0, TRACKBAR_CLASSW, L"",
+                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ, 24, 258, 720, 42, kGuiCutoff) ||
+                !make_control(0, L"STATIC", L"Master Output",
+                              WS_CHILD | WS_VISIBLE, 24, 332, 240, 24, kGuiMasterLabel) ||
+                !make_control(0, TRACKBAR_CLASSW, L"",
+                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ, 24, 358, 720, 42, kGuiMaster)) {
+                return -1;
+            }
+
+            const auto material = GetDlgItem(window, kGuiMaterial);
+            SendMessageW(material, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
+            SendMessageW(material, TBM_SETPOS, TRUE,
+                         static_cast<LPARAM>(std::lround(plugin->get_param(kParamMaterialMorph) * 100.0f)));
+
+            const auto cutoff = GetDlgItem(window, kGuiCutoff);
+            SendMessageW(cutoff, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
+            const auto cutoff_norm = std::log(plugin->get_param(kParamSvfCutoffHz) / 40.0f) /
+                                     std::log(18000.0f / 40.0f);
+            SendMessageW(cutoff, TBM_SETPOS, TRUE,
+                         static_cast<LPARAM>(std::lround(cutoff_norm * 100.0f)));
+
+            const auto master = GetDlgItem(window, kGuiMaster);
+            SendMessageW(master, TBM_SETRANGE, TRUE, MAKELONG(0, 150));
+            SendMessageW(master, TBM_SETPOS, TRUE,
+                         static_cast<LPARAM>(std::lround(plugin->get_param(kParamMasterGain) * 100.0f)));
+            return 0;
+        }
+        case WM_SIZE:
+            if (plugin) plugin->resize_windows_gui();
+            return 0;
+        case WM_COMMAND:
+            if (plugin && HIWORD(wparam) == BN_CLICKED) {
+                plugin->handle_windows_command(LOWORD(wparam));
+                return 0;
+            }
+            break;
+        case WM_HSCROLL:
+            if (plugin && lparam != 0) {
+                const auto control = reinterpret_cast<HWND>(lparam);
+                plugin->handle_windows_scroll(static_cast<unsigned int>(GetDlgCtrlID(control)),
+                                              static_cast<int>(SendMessageW(control, TBM_GETPOS, 0, 0)));
+                return 0;
+            }
+            break;
+        case WM_NCDESTROY:
+            if (plugin) plugin->on_windows_gui_destroyed(window);
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            break;
+    }
+
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+} // namespace
+
+bool TectonicSynthPlugin::attach_windows_gui(void* parent) noexcept {
+    if (!gui_created_ || !parent || !IsWindow(static_cast<HWND>(parent))) return false;
+
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
+    if (!InitCommonControlsEx(&controls)) return false;
+    HMODULE plugin_module = nullptr;
+    const auto wnd_proc_address =
+        reinterpret_cast<LPCWSTR>(reinterpret_cast<std::uintptr_t>(&windows_gui_window_proc));
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            wnd_proc_address, &plugin_module)) {
+        return false;
+    }
+
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.style = CS_OWNDC;
+    window_class.lpfnWndProc = windows_gui_window_proc;
+    window_class.hInstance = plugin_module;
+    window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    window_class.lpszClassName = kWindowsGuiClassName;
+    if (!RegisterClassExW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+
+    if (gui_window_) DestroyWindow(gui_window_);
+    gui_window_ = CreateWindowExW(0, kWindowsGuiClassName, L"Tectonic Synth v5",
+                                  WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                  0, 0, static_cast<int>(gui_width_), static_cast<int>(gui_height_),
+                                  static_cast<HWND>(parent), nullptr, window_class.hInstance, this);
+    return gui_window_ != nullptr;
+}
+
+void TectonicSynthPlugin::destroy_windows_gui() noexcept {
+    gui_created_ = false;
+    if (gui_window_) DestroyWindow(gui_window_);
+}
+
+void TectonicSynthPlugin::show_windows_gui(bool visible) noexcept {
+    if (!gui_window_) return;
+    ShowWindow(gui_window_, visible ? SW_SHOW : SW_HIDE);
+    if (visible) UpdateWindow(gui_window_);
+}
+
+void TectonicSynthPlugin::resize_windows_gui() noexcept {
+    if (!gui_window_) return;
+    RECT client{};
+    if (!GetClientRect(gui_window_, &client)) return;
+    const int width = client.right - client.left;
+    const int content_width = std::max(240, width - 48);
+    const auto move_control = [this, content_width](int id, int x, int y, int w, int h) {
+        if (const auto control = GetDlgItem(gui_window_, id)) {
+            MoveWindow(control, x, y, w == -1 ? content_width : w, h, TRUE);
+        }
+    };
+
+    move_control(kGuiTitle, 24, 18, -1, 32);
+    move_control(kGuiModePiano, 24, 62, 170, 34);
+    move_control(kGuiModeMidi, 204, 62, 170, 34);
+    move_control(kGuiModeBounce, 384, 62, 170, 34);
+    move_control(kGuiModeHub, 564, 62, 190, 34);
+    move_control(kGuiMaterialLabel, 24, 132, 240, 24);
+    move_control(kGuiMaterial, 24, 158, -1, 42);
+    move_control(kGuiCutoffLabel, 24, 232, 240, 24);
+    move_control(kGuiCutoff, 24, 258, -1, 42);
+    move_control(kGuiMasterLabel, 24, 332, 240, 24);
+    move_control(kGuiMaster, 24, 358, -1, 42);
+}
+
+void TectonicSynthPlugin::handle_windows_command(unsigned int control_id) noexcept {
+    switch (control_id) {
+        case kGuiModePiano: push_gui_param_change(kParamUiMode, 0.0); break;
+        case kGuiModeMidi: push_gui_param_change(kParamUiMode, 1.0); break;
+        case kGuiModeBounce: push_gui_param_change(kParamUiMode, 2.0); break;
+        case kGuiModeHub: push_gui_param_change(kParamUiMode, 3.0); break;
+        default: break;
+    }
+}
+
+void TectonicSynthPlugin::handle_windows_scroll(unsigned int control_id, int position) noexcept {
+    switch (control_id) {
+        case kGuiMaterial:
+            push_gui_param_change(kParamMaterialMorph, std::clamp(position / 100.0, 0.0, 1.0));
+            break;
+        case kGuiCutoff: {
+            const double normalized = std::clamp(position / 100.0, 0.0, 1.0);
+            push_gui_param_change(kParamSvfCutoffHz, 40.0 * std::pow(18000.0 / 40.0, normalized));
+            break;
+        }
+        case kGuiMaster:
+            push_gui_param_change(kParamMasterGain, std::clamp(position / 100.0, 0.0, 1.5));
+            break;
+        default: break;
+    }
+}
+#endif
 
 // ============================================================================
 // SECTION IX: CLAP C-ABI EXTENSION TABLES & FACTORY ENTRY POINT
@@ -2934,35 +3175,42 @@ static bool CLAP_ABI ext_gui_is_api_supported(const clap_plugin_t*, const char* 
     if (is_floating || !api) return false;
 #if defined(_WIN32)
     return std::strcmp(api, CLAP_WINDOW_API_WIN32) == 0;
-#elif defined(__APPLE__)
-    return std::strcmp(api, CLAP_WINDOW_API_COCOA) == 0;
 #else
-    return std::strcmp(api, CLAP_WINDOW_API_X11) == 0;
+    return false;
 #endif
 }
 
 static bool CLAP_ABI ext_gui_get_preferred_api(
     const clap_plugin_t*, const char** api, bool* is_floating) {
     if (!api || !is_floating) return false;
-    *is_floating = false;
 #if defined(_WIN32)
+    *is_floating = false;
     *api = CLAP_WINDOW_API_WIN32;
-#elif defined(__APPLE__)
-    *api = CLAP_WINDOW_API_COCOA;
-#else
-    *api = CLAP_WINDOW_API_X11;
-#endif
     return true;
+#else
+    *api = nullptr;
+    *is_floating = false;
+    return false;
+#endif
 }
 
 static bool CLAP_ABI ext_gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) {
     if (!ext_gui_is_api_supported(plugin, api, is_floating)) return false;
-    self_from_plugin(plugin)->step_gui_frame_60fps();
-    return true;
+#if defined(_WIN32)
+    return self_from_plugin(plugin)->create_windows_gui();
+#else
+    return false;
+#endif
 }
 
-static void CLAP_ABI ext_gui_destroy(const clap_plugin_t*) {}
-static bool CLAP_ABI ext_gui_set_scale(const clap_plugin_t*, double) { return true; }
+static void CLAP_ABI ext_gui_destroy(const clap_plugin_t* plugin) {
+#if defined(_WIN32)
+    self_from_plugin(plugin)->destroy_windows_gui();
+#else
+    (void)plugin;
+#endif
+}
+static bool CLAP_ABI ext_gui_set_scale(const clap_plugin_t*, double) { return false; }
 
 static bool CLAP_ABI ext_gui_get_size(
     const clap_plugin_t* plugin, uint32_t* width, uint32_t* height) {
@@ -2996,25 +3244,42 @@ static bool CLAP_ABI ext_gui_adjust_size(
 
 static bool CLAP_ABI ext_gui_set_size(
     const clap_plugin_t* plugin, uint32_t width, uint32_t height) {
-    self_from_plugin(plugin)->set_gui_size(width, height);
+    auto* self = self_from_plugin(plugin);
+    self->set_gui_size(width, height);
     return true;
 }
 
-static bool CLAP_ABI ext_gui_set_parent(const clap_plugin_t* plugin, const clap_window_t*) {
-    ScopedGlStateGuard gl_guard{};
-    self_from_plugin(plugin)->step_gui_frame_60fps();
-    return true;
+static bool CLAP_ABI ext_gui_set_parent(const clap_plugin_t* plugin, const clap_window_t* window) {
+#if defined(_WIN32)
+    return window && window->api && std::strcmp(window->api, CLAP_WINDOW_API_WIN32) == 0 &&
+           self_from_plugin(plugin)->attach_windows_gui(window->win32);
+#else
+    (void)plugin;
+    (void)window;
+    return false;
+#endif
 }
 
 static bool CLAP_ABI ext_gui_set_transient(const clap_plugin_t*, const clap_window_t*) { return true; }
 static void CLAP_ABI ext_gui_suggest_title(const clap_plugin_t*, const char*) {}
 
 static bool CLAP_ABI ext_gui_show(const clap_plugin_t* plugin) {
-    self_from_plugin(plugin)->step_gui_frame_60fps();
+#if defined(_WIN32)
+    self_from_plugin(plugin)->show_windows_gui(true);
+#else
+    (void)plugin;
+#endif
     return true;
 }
 
-static bool CLAP_ABI ext_gui_hide(const clap_plugin_t*) { return true; }
+static bool CLAP_ABI ext_gui_hide(const clap_plugin_t* plugin) {
+#if defined(_WIN32)
+    self_from_plugin(plugin)->show_windows_gui(false);
+#else
+    (void)plugin;
+#endif
+    return true;
+}
 
 static const clap_plugin_gui_t kExtGui = {
     ext_gui_is_api_supported,
@@ -3051,7 +3316,7 @@ static const clap_plugin_descriptor_t kPluginDescriptor = {
     "https://github.com/tectonic-audio/tectonic-synth-v5",
     "https://github.com/tectonic-audio/tectonic-synth-v5/wiki",
     "https://github.com/tectonic-audio/tectonic-synth-v5/issues",
-    "5.0.0",
+    "5.0.1",
     "Ultra-Performance Physical Waveguide, 64-Mode Spectral Plasma & Farey Lattice CLAP Synthesizer",
     kPluginFeatures
 };
